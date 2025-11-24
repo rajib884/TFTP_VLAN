@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <windows.h>
 #include <wchar.h>
 #include <locale.h>
 
@@ -7,15 +9,23 @@
 
 uint8_t MY_MAC[6] = {0};
 uint32_t MY_IP = 0;
-uint8_t MY_NAME[512] = {0};
-
 uint16_t ipv4_id = 1234; // Just a random starting point
 
 
 int main()
 {
+    int run = 1;
+
     setlocale(LC_ALL, "");
     debug("Hello World!\n");
+
+    HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\BulBulTFTPMutex");
+    
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        printf("Another instance is already running in this device.\n");
+        CloseHandle(hMutex);
+        return 1;
+    }
 
     pcap_t *handle;
 
@@ -23,10 +33,10 @@ int main()
 
     if (handle == NULL){
         printf("Error initializing pcap: %s\n", pcap_geterr(handle));
-        return 1;
+        goto cleanup;
     }
 
-    printf("\nStarting packet capture loop...\n");
+    printf("\nListening...\n");
 
     // pcap_loop(handle, 0, packet_handler, (uint8_t *)handle);
 
@@ -34,18 +44,30 @@ int main()
     struct pcap_pkthdr *header;
     const u_char *pkt_data;
     int res;
-    while (1) {
+
+    while (run)
+    {
         res = pcap_next_ex(handle, &header, &pkt_data);
-        if (res == 1) {
-            // Got a packet
+
+        switch (res)
+        {
+        case 1: // Got a packet
             packet_handler((uint8_t *)handle, header, pkt_data);
-        } else if (res == 0) {
-            // Timeout, fall through to check sessions
-        } else if (res == -1) {
+            break;
+
+        case 0: // Timeout, fall through to check sessions
+            break;
+
+        case -1: // Error
             printf("Error reading packet: %s\n", pcap_geterr(handle));
             break;
-        } else if (res == -2) {
-            // EOF
+
+        case -2: // EOF
+            run = 0;
+            printf("End of packet capture.\n");
+            break;
+
+        default:
             break;
         }
 
@@ -54,6 +76,14 @@ int main()
         // Sleep(100); // avoid busy loop
     }
 
-    pcap_close(handle);
-    return 0;
+cleanup:
+    printf("Exiting...\n");
+    clean_all_sessions();
+    if (handle != NULL) {
+        pcap_close(handle);
+    }
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
+
+    return run;
 }

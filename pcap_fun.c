@@ -42,7 +42,7 @@ int get_ip_mac_name(const char *interface_name, ip_mac_name_t *info)
     {
         if (pCurrent->PhysicalAddressLength == 6 && strcmp(pCurrent->AdapterName, interface_name + 12) == 0)
         {
-            wprintf(L"Name: %ls, ", pCurrent->FriendlyName);
+            // wprintf(L"Name: %ls, ", pCurrent->FriendlyName);
             wcsncpy(info->name, pCurrent->FriendlyName, sizeof(info->name) / sizeof(info->name[0]));
             info->name[sizeof(info->name) / sizeof(info->name[0]) - 1] = L'\0';
 
@@ -96,6 +96,8 @@ pcap_t *initialize_pcap()
     char filter_exp[512] = "";
     bpf_u_int32 net;
 
+    int rc = 0;
+
     debug("Finding devices...\n");
 
     ip_mac_name_t infos[99] = {0};
@@ -109,17 +111,23 @@ pcap_t *initialize_pcap()
     int info_len = 0, i = 0;
     for (dev = alldevs; dev; dev = dev->next)
     {
-        debug("  Checking: %-50s, %s, ", dev->name, dev->description ? dev->description : "(No description available)");
+        debug("  Checking %-50s\n", dev->name);
         if (info_len >= sizeof(infos) / sizeof(infos[0]) - 1){
             printf("Too many devices, some are not listed...\n");
             break;
         }
 
         if (get_ip_mac_name(dev->name, &infos[info_len]) != TRUE){
-            debug("unknown\n");
+            debug("    IP  : Unknown\n");
+            debug("    Name: Unknown\n");
+            debug("    Desc: %s\n\n", dev->description ? dev->description : "(No description available)");
             continue;
         } else {
-            debug("%s\n", inet_ntoa(*(struct in_addr *)&infos[info_len].ip));
+            debug("    IP  : %s\n", inet_ntoa(*(struct in_addr *)&infos[info_len].ip));
+#ifdef DEBUG
+            wprintf(L"    Name: %ls\n", infos[info_len].name);
+#endif
+            debug("    Desc: %s\n\n", dev->description ? dev->description : "(No description available)");
         }
             
         if (pcap_lookupnet(dev->name, &infos[info_len].ip_mask, &infos[info_len].mask, errbuf) == -1)
@@ -142,20 +150,37 @@ pcap_t *initialize_pcap()
 
     debug("\n");
 
-    printf("Select an interface:\n"); 
-    for (i = 0; i < info_len; i++)
+    /* Auto-select "Ethernet" if present */
+    for (i = 0, rc = 0; i < info_len; i++)
     {
-        printf("%2d:", i + 1);
-        printf(" %-16s", inet_ntoa(*(struct in_addr *)&infos[i].ip));
-        wprintf(L", %ls", infos[i].name);
-        // printf(" %-50s", infos[dev_choice].dev->name);
-        // printf(", %s", infos[dev_choice].dev->description ? infos[dev_choice].dev->description : "(No description available)");
-        printf("\n");
+        if (wcscmp(infos[i].name, L"Ethernet") == 0)
+        {
+            infos[i].ip += 0x0e000000; // Force little-endian
+            rc = 1;
+            wprintf(L"Auto-selected %ls, ", infos[i].name);
+            printf("%s\n", inet_ntoa(*(struct in_addr *)&infos[i].ip));
+            i++; // Selection is i+1 for user
+            break;
+        }
     }
-    printf("Enter interface (number): ");
-    scanf("%d", &i);
 
-    if (i < 1 || i > info_len)
+    if (!rc)
+    {    
+        printf("Select an interface:\n"); 
+        for (i = 0; i < info_len; i++)
+        {
+            printf("%2d:", i + 1);
+            printf(" %-16s", inet_ntoa(*(struct in_addr *)&infos[i].ip));
+            wprintf(L", %ls", infos[i].name);
+            // printf(" %-50s", infos[dev_choice].dev->name);
+            // printf(", %s", infos[dev_choice].dev->description ? infos[dev_choice].dev->description : "(No description available)");
+            printf("\n");
+        }
+        printf("Enter interface (number): ");
+        rc = scanf("%d", &i);
+    }
+
+    if (!rc || (i < 1) || (info_len < i))
     {
         printf("Invalid choice.\n");
         goto err;
@@ -176,22 +201,27 @@ pcap_t *initialize_pcap()
 
 
 
-    wprintf(L"\nInitializing %ls [%s]...", infos[i - 1].name, dev->name);
+    wprintf(L"\nInitializing %ls [%s]... ", infos[i - 1].name, dev->name);
     handle = pcap_create(dev->name, errbuf);
-    if (!handle) {
+    if (!handle)
+    {
         fprintf(stderr, "Error creating pcap handle: %s\n", errbuf);
         goto err;
     }
+
     if (pcap_set_snaplen(handle, 65536) != 0 ||
         pcap_set_promisc(handle, 1) != 0 ||
-        pcap_set_timeout(handle, 1000) != 0 ||
-        pcap_set_immediate_mode(handle, 1) != 0) {
+        pcap_set_timeout(handle, 500) != 0 ||
+        pcap_set_immediate_mode(handle, 1) != 0)
+    {
         fprintf(stderr, "Error setting pcap options: %s\n", pcap_geterr(handle));
         pcap_close(handle);
         handle = NULL;
         goto err;
     }
-    if (pcap_activate(handle) != 0) {
+
+    if (pcap_activate(handle) != 0)
+    {
         fprintf(stderr, "Error activating pcap handle: %s\n", pcap_geterr(handle));
         pcap_close(handle);
         handle = NULL;
@@ -206,11 +236,14 @@ pcap_t *initialize_pcap()
 
 #ifdef USE_VLAN
     snprintf(filter_exp, sizeof(filter_exp),
-             "vlan and (arp or (udp and dst host %s and (dst port 69 or (dst portrange %d-%d))))",
+             "vlan and ((arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or icmp[0] == 8 or (udp and dst host %s and (dst port 69 or (dst portrange %d-%d))))",
+             (unsigned int)htonl(infos[i - 1].ip),
              inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), START_PORT, START_PORT + MAX_SESSIONS);
 #else
     snprintf(filter_exp, sizeof(filter_exp),
-             "udp and dst host %s and (dst port 69 or (dst portrange %d-%d))",
+             // "udp and dst host %s and (dst port 69 or (dst portrange %d-%d))",
+             "(arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or (ip and dst host %s and ((icmp and icmp[0] == 8) or (udp and (udp dst port 69 or (udp dst portrange %d-%d)))))",
+             (unsigned int)htonl(infos[i - 1].ip),
              inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), START_PORT, START_PORT + MAX_SESSIONS);
 #endif
 

@@ -1,0 +1,6 @@
+external
+Packet.dll
+test.exe
+testfile
+wpcap.dll
+.vscode

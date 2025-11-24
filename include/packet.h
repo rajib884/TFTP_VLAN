@@ -4,21 +4,35 @@
 #include <stdint.h>
 #include <pcap.h>
 
+#define MAX_BLOCK_SIZE 65535 // Maximum UDP block size
+#define MIN_BLOCK_SIZE 8     // Minimum UDP block size
+#define DEFAULT_BLOCK_SIZE 512 // Default UDP block size
 
-#define VLAN_TAG_OFFSET 12
-#define ETH_TYPE_OFFSET 16
-#define ARP_OFFSET 18
-#define ARP_OPCODE_OFFSET 20
-#define ARP_SENDER_MAC_OFFSET 22
-#define ARP_SENDER_IP_OFFSET 28
-#define ARP_TARGET_MAC_OFFSET 32
-#define ARP_TARGET_IP_OFFSET 38
+#define MAX_WINDOWSIZE 65535 // Maximum window size
+#define MIN_WINDOWSIZE 1   // Minimum window size
+#define DEFAULT_WINDOWSIZE 1   // Default window size
+
+#define MAX_TIMEOUT 60000 // Maximum timeout in milliseconds
+#define MIN_TIMEOUT 1000  // Minimum timeout in milliseconds
+#define DEFAULT_TIMEOUT 1000 // Default timeout in milliseconds
+
+#define START_PORT 20001 // Starting port for TFTP sessions
+#define MAX_SESSIONS 30 // Maximum concurrent TFTP sessions
+
 
 #define ETHERTYPE_VLAN 0x8100
 #define ETHERTYPE_ARP 0x0806
 #define ETHERTYPE_IPV4 0x0800
 #define ARP_REQUEST 0x0001
 #define ARP_REPLY 0x0002
+#define ARP_HW_TYPE_ETHERNET 0x0001
+
+#define IPV4_PROTOCOL_UDP 17
+#define IPV4_PROTOCOL_ICMP 1
+
+#define ICMP_ECHO_REQUEST 8
+#define ICMP_ECHO_REPLY   0
+#define ICMP_MAX_DATA     5000
 
 #define COMPARE_MAC(mac1, mac2) \
     ((mac1[0] == mac2[0]) &&    \
@@ -37,6 +51,17 @@
      (mac1[5] == 0xff))
 
 
+/* tftp opcode mnemonic */
+enum opcode
+{
+    OPCODE_RRQ = 1,
+    OPCODE_WRQ,
+    OPCODE_DATA,
+    OPCODE_ACK,
+    OPCODE_ERROR,
+    OPCODE_OACK
+};
+
 struct eth_header
 {
     uint8_t dest_mac[6];
@@ -46,7 +71,23 @@ struct eth_header
     uint16_t vlan_tci;
 #endif
     uint16_t ethertype;
+    uint8_t data[];
 };
+
+#pragma pack(1)
+struct arp_header
+{
+    uint16_t hw_type;
+    uint16_t protocol_type;
+    uint8_t hw_size;
+    uint8_t protocol_size;
+    uint16_t opcode;
+    uint8_t sender_mac[6];
+    uint32_t sender_ip;
+    uint8_t target_mac[6];
+    uint32_t target_ip;
+};
+#pragma pack(0)
 
 struct ipv4_header
 {
@@ -60,7 +101,20 @@ struct ipv4_header
     uint16_t checksum;     // Header checksum
     uint32_t src_addr;     // Source IP address
     uint32_t dest_addr;    // Destination IP address
+    uint8_t data[];        // Payload
 };
+
+#pragma pack(1)
+struct icmp_header
+{
+    uint8_t type;
+    uint8_t code;
+    uint16_t checksum;
+    uint16_t identifier;
+    uint16_t sequence;
+    uint8_t data[];
+};
+#pragma pack(0)
 
 struct udp_header
 {
@@ -70,7 +124,6 @@ struct udp_header
     uint16_t checksum;
 };
 
-
 typedef union
 {
     uint16_t opcode;
@@ -78,14 +131,14 @@ typedef union
     struct
     {
         uint16_t opcode; /* RRQ or WRQ */
-        uint8_t filename_and_mode[514];
+        uint8_t filename_and_mode[MAX_BLOCK_SIZE + 2];
     } request;
 
     struct
     {
         uint16_t opcode; /* DATA */
         uint16_t block_number;
-        uint8_t data[512];
+        uint8_t data[MAX_BLOCK_SIZE];
     } data;
 
     struct
@@ -98,42 +151,46 @@ typedef union
     {
         uint16_t opcode; /* ERROR */
         uint16_t error_code;
-        uint8_t error_string[512];
+        uint8_t error_string[MAX_BLOCK_SIZE];
     } error;
     
     struct
     {
         uint16_t opcode; /* OACK */
-        uint8_t options[514];
+        uint8_t options[MAX_BLOCK_SIZE + 2];
     } oack;
 
 } tftp_message;
 
 
-/* tftp opcode mnemonic */
-enum opcode
-{
-    OPCODE_RRQ = 1,
-    OPCODE_WRQ,
-    OPCODE_DATA,
-    OPCODE_ACK,
-    OPCODE_ERROR,
-    OPCODE_OACK
-};
-
-
 #pragma pack(1)
 struct arp_packet
 {
-    uint16_t hw_type;
-    uint16_t protocol_type;
-    uint8_t hw_size;
-    uint8_t protocol_size;
-    uint16_t opcode;
-    uint8_t sender_mac[6];
-    uint32_t sender_ip;
-    uint8_t target_mac[6];
-    uint32_t target_ip;
+    struct eth_header eth;
+    struct arp_header arp;
+};
+
+struct ipv4_packet
+{
+    struct eth_header eth;
+    struct ipv4_header ip;
+    uint8_t data[];
+};
+
+struct icmp_packet
+{
+    struct eth_header eth;
+    struct ipv4_header ip;
+    struct icmp_header icmp;
+    uint8_t data[];
+};
+
+struct udp_packet
+{
+    struct eth_header eth;
+    struct ipv4_header ip;
+    struct udp_header udp;
+    uint8_t data[];
 };
 
 struct tftp_packet
@@ -168,16 +225,10 @@ extern uint32_t MY_IP;
 #endif
 
 
-#define START_PORT 20001 // Starting port for TFTP sessions
-#define MAX_SESSIONS 5 // Maximum concurrent TFTP sessions
-
 void print_mac(const uint8_t *mac);
 unsigned short ipv4_checksum(const void *buf, size_t len);
 unsigned short udp_checksum(const struct ipv4_header *ip, const struct udp_header *udp);
 void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8_t *pkt);
-void send_arp_reply(pcap_t *handle, const uint8_t *pkt, struct eth_header *eth_vlan, struct arp_packet *arp_req);
-
-
-extern void handle_tftp(pcap_t *handle, struct tftp_packet *pkt, uint32_t pkt_len);
+int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet_len);
 
 #endif /* PACKET_H */
