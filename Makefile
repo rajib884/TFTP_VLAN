@@ -2,12 +2,22 @@
 
 CC=gcc
 CFLAGS=-Wall -I "C:\Program Files\Npcap\Include" -I "include" -D_WIN32_WINNT=0x0600
-LDFLAGS=-L "C:\Program Files\Npcap\Lib" -lwpcap -lpacket -lws2_32 -liphlpapi
+LDFLAGS=-L "C:\Program Files\Npcap\Lib\x64" -lwpcap -lpacket -lws2_32 -liphlpapi
+MYFLAGS= -DVALIDATE_CHECKSUM
 
-all: test
+all: main spoof debug
 
-test: raw.c
-	$(CC) -o test main.c packet.c pcap_fun.c tftp.c $(CFLAGS) $(LDFLAGS)
+main:
+	$(CC) -o main main.c packet.c pcap_fun.c tftp.c queue.c $(CFLAGS) $(LDFLAGS) $(MYFLAGS)
+
+spoof:
+	$(CC) -o ip_spoof main.c packet.c pcap_fun.c tftp.c queue.c $(CFLAGS) $(LDFLAGS) $(MYFLAGS) -DSPOOF_NON_VLAN
+
+.PHONY: debug clean
+debug:
+	$(CC) -g -O0 -o debug main.c packet.c pcap_fun.c tftp.c queue.c $(CFLAGS) $(LDFLAGS) $(MYFLAGS) -DDEBUG
+	$(CC) -g -O0 -o debug_ip_spoof main.c packet.c pcap_fun.c tftp.c queue.c $(CFLAGS) $(LDFLAGS) $(MYFLAGS) -DDEBUG -DSPOOF_NON_VLAN
+	
 
 clean:
-	del /Q test.exe test
+	cmd /C "if exist test.exe del /Q test.exe"

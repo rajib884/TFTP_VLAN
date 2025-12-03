@@ -16,9 +16,12 @@
 #define MIN_TIMEOUT 1000  // Minimum timeout in milliseconds
 #define DEFAULT_TIMEOUT 1000 // Default timeout in milliseconds
 
+#define REQUEST_PORT 69 // TFTP request port
 #define START_PORT 20001 // Starting port for TFTP sessions
-#define MAX_SESSIONS 30 // Maximum concurrent TFTP sessions
+#define MAX_SESSIONS 15 // Maximum concurrent TFTP sessions
 
+#define MAX_FILE_SIZE_TO_PREALLOCATE (50 * 1024 * 1024) // 50 MB
+#define MAX_PREALLOCATE (2 * MAX_WINDOWSIZE)
 
 #define ETHERTYPE_VLAN 0x8100
 #define ETHERTYPE_ARP 0x0806
@@ -62,19 +65,35 @@ enum opcode
     OPCODE_OACK
 };
 
-struct eth_header
+
+#pragma pack(1)
+struct eth_base
 {
     uint8_t dest_mac[6];
     uint8_t src_mac[6];
-#ifdef USE_VLAN
-    uint16_t vlan_tpid;
-    uint16_t vlan_tci;
-#endif
     uint16_t ethertype;
     uint8_t data[];
 };
 
-#pragma pack(1)
+struct eth_header
+{
+    uint8_t dest_mac[6];
+    uint8_t src_mac[6];
+// #ifdef USE_VLAN
+    uint16_t vlan_tpid;
+    uint16_t vlan_tci;
+// #endif
+    uint16_t ethertype;
+    uint8_t data[];
+};
+
+struct eth_mover
+{
+    uint32_t padding;
+    struct eth_base eth;
+    uint8_t data[];
+};
+
 struct arp_header
 {
     uint16_t hw_type;
@@ -87,12 +106,11 @@ struct arp_header
     uint8_t target_mac[6];
     uint32_t target_ip;
 };
-#pragma pack(0)
 
 struct ipv4_header
 {
     uint8_t version_ihl;   // Version (4 bits) and IHL (4 bits)
-    uint8_t tos;           // Type of Service
+    uint8_t tos;           // Type of Service  ??
     uint16_t total_length; // Total length (header + data)
     uint16_t id;           // Identification
     uint16_t flags_offset; // Flags (3 bits) and Fragment Offset (13 bits)
@@ -104,17 +122,15 @@ struct ipv4_header
     uint8_t data[];        // Payload
 };
 
-#pragma pack(1)
 struct icmp_header
 {
     uint8_t type;
     uint8_t code;
     uint16_t checksum;
-    uint16_t identifier;
-    uint16_t sequence;
+    // uint16_t identifier;
+    // uint16_t sequence;
     uint8_t data[];
 };
-#pragma pack(0)
 
 struct udp_header
 {
@@ -162,8 +178,6 @@ typedef union
 
 } tftp_message;
 
-
-#pragma pack(1)
 struct arp_packet
 {
     struct eth_header eth;
@@ -224,11 +238,26 @@ extern uint32_t MY_IP;
 #define MEM_ERROR -1
 #endif
 
+typedef struct {
+    LARGE_INTEGER start;
+    LARGE_INTEGER frequency;
+} timer_t;
+
+extern timer_t processing_timer;
+
+void timer_start(timer_t* timer);
+uint64_t timer_elapsed_us(timer_t* timer);
+void timer_init(timer_t* timer);
 
 void print_mac(const uint8_t *mac);
+void print_ipv4(const struct ipv4_header *hdr);
+void print_udp(const struct udp_header *hdr);
+void print_raw_data(const uint8_t *data, size_t len);
+
 unsigned short ipv4_checksum(const void *buf, size_t len);
 unsigned short udp_checksum(const struct ipv4_header *ip, const struct udp_header *udp);
 void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8_t *pkt);
 int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet_len);
+
 
 #endif /* PACKET_H */

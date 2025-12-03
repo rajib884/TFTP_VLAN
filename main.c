@@ -45,6 +45,8 @@ int main()
     const u_char *pkt_data;
     int res;
 
+    timer_init(&processing_timer);
+
     while (run)
     {
         res = pcap_next_ex(handle, &header, &pkt_data);
@@ -71,6 +73,7 @@ int main()
             break;
         }
 
+        timer_start(&processing_timer);
         session_check(handle);
 
         // Sleep(100); // avoid busy loop

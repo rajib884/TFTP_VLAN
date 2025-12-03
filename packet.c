@@ -12,21 +12,65 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 extern void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len);
 extern uint16_t ipv4_id;
 
-void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8_t *pkt)
+timer_t processing_timer;
+
+void timer_init(timer_t *timer)
 {
-    pcap_t *handle = (pcap_t *)user;
-    const struct eth_header *eth = (const struct eth_header *)pkt;
+    QueryPerformanceFrequency(&timer->frequency);
+}
+
+void timer_start(timer_t *timer)
+{
+    QueryPerformanceCounter(&timer->start);
+}
+
+uint64_t timer_elapsed_us(timer_t *timer)
+{
+    LARGE_INTEGER end;
+    QueryPerformanceCounter(&end);
+    return (uint64_t)(end.QuadPart - timer->start.QuadPart);
+}
+
+void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8_t *pkt)
+{    pcap_t *handle = (pcap_t *)user;
+    const struct eth_base *eth_b = (const struct eth_base *)pkt;
+    struct eth_header *eth;
+    uint8_t needs_to_free = FALSE;
+    size_t pkt_len = 0;
+
+    timer_start(&processing_timer);
 
     if (pkthdr->caplen < sizeof(struct eth_header))
-        return;
+        goto cleanup;
+
+    if (eth_b->ethertype == htons(ETHERTYPE_VLAN))
+    {
+        eth = (struct eth_header *)pkt;
+        pkt_len = pkthdr->caplen;
+        needs_to_free = FALSE;
+    }
+    else
+    {
+        pkt_len = pkthdr->caplen + 4; // +4 for VLAN header
+        eth = (struct eth_header *)malloc(pkt_len);
+        if (eth == NULL)
+            return;
+        memcpy((void *)eth->data, eth_b->data, pkthdr->caplen - sizeof(struct eth_base));
+        needs_to_free = TRUE;
+
+        // Fill VLAN header
+        memcpy((void *)eth->dest_mac, eth_b->dest_mac, sizeof(eth->dest_mac));
+        memcpy((void *)eth->src_mac, eth_b->src_mac, sizeof(eth->src_mac));
+        eth->vlan_tpid = htons(ETHERTYPE_VLAN);
+        eth->vlan_tci = (uint16_t)-1; // Untagged
+        eth->ethertype = eth_b->ethertype;
+    }
 
     if (!COMPARE_MAC(eth->dest_mac, MY_MAC) && !IS_BROADCAST_MAC(eth->dest_mac))
-        return;
+        goto cleanup;
 
-#ifdef USE_VLAN
     if (ntohs(eth->vlan_tpid) != ETHERTYPE_VLAN)
-        return;
-#endif
+        goto cleanup;
 
 #if 0 
     /* gettimeofday causes segmentation fault */
@@ -49,20 +93,29 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
     {
     case ETHERTYPE_IPV4:
         debug("IPv4 Packet\n");
-        handle_ipv4(handle, pkt, pkthdr->caplen);
+        handle_ipv4(handle, (const uint8_t *)eth, pkt_len);
         break;
 
     case ETHERTYPE_ARP:
         debug("ARP\n");
-        handle_arp(handle, (const struct arp_packet *)pkt, pkthdr->caplen);
+#ifndef SPOOF_NON_VLAN
+        if (eth->vlan_tci == (uint16_t)-1) // Skip non VLAN ARP
+            break;
+#endif
+        handle_arp(handle, (const struct arp_packet *)eth, pkt_len);
         break;
 
     default:
         debug(" Unknown packet, Ethertype: %x\n", ntohs(eth->ethertype));
         break;
     }
-}
 
+cleanup:
+    if (needs_to_free != FALSE && eth != NULL)
+        free(eth);
+    eth = NULL;
+    return;
+}
 
 static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_len)
 {
@@ -72,59 +125,116 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
         return;
     }
 
-    const struct ipv4_packet *eth_ip = (const struct ipv4_packet *)pkt;
+    const struct ipv4_packet *ipv4_pkt = (const struct ipv4_packet *)pkt;
 
-    if (ntohl(eth_ip->ip.dest_addr) != MY_IP)
+    if (ntohl(ipv4_pkt->ip.dest_addr) != MY_IP)
     {
         debug("  Not my IP.\n");
         return;
     }
 
-    if ((eth_ip->ip.version_ihl & 0x0F) != 5)
+    if (ipv4_pkt->ip.version_ihl != 0x45) // IPv4 with no options
     {
         debug("  Not supported.\n");
         return;
     }
 
-    uint16_t received_checksum = eth_ip->ip.checksum;
+    if (ntohs(ipv4_pkt->ip.total_length) + sizeof(struct eth_header) > pkt_len)
+    {
+        debug("  IP length mismatch.\n");
+        return;
+    }
 
-    // Compute checksum on a local copy
-    struct ipv4_header hdr = eth_ip->ip;
-    hdr.checksum = 0;
+    if (ipv4_pkt->ip.flags_offset & htons(0x3FFF))
+    {
+        debug("  Fragmented packet, not supported.\n");
+        return;
+    }
 
+    if (ipv4_pkt->ip.ttl == 0)
+    {
+        debug("  TTL expired.\n");
+        return;
+    }
+
+#ifdef VALIDATE_CHECKSUM
     // If checksum field is non-zero, validate it.
-    if (received_checksum != 0 && ipv4_checksum(&hdr, sizeof(hdr)) != received_checksum)
+    if (ipv4_pkt->ip.checksum != 0 && ipv4_checksum(&ipv4_pkt->ip, sizeof(ipv4_pkt->ip)) != 0)
     {
         debug("  Invalid checksum.\n");
         return;
     }
+#endif
 
-    if (eth_ip->ip.protocol == IPV4_PROTOCOL_UDP)
+    if (ipv4_pkt->ip.protocol == IPV4_PROTOCOL_UDP)
     {
         const struct tftp_packet *packet = (const struct tftp_packet *)pkt;
 
-        if (pkt_len < sizeof(struct eth_header) + sizeof(struct ipv4_header) + sizeof(struct udp_header) + 4)
+        if (pkt_len < sizeof(struct udp_packet) + 4)
         {
             debug("  Too short for TFTP.\n");
             return;
         }
+
+        if (ntohs(packet->udp.len) + sizeof(struct ipv4_packet) > pkt_len)
+        {
+            debug("  UDP length mismatch.\n");
+            return;
+        }
+
+#ifdef VALIDATE_CHECKSUM
+        if (packet->udp.checksum != 0 && udp_checksum(&ipv4_pkt->ip, &packet->udp) != 0)
+        {
+            debug("  Invalid UDP checksum.\n");
+            return;
+        }
+#endif
 
         debug("  Src: %s:%u\n", inet_ntoa(*(const struct in_addr *)&packet->ip.src_addr), ntohs(packet->udp.source));
         debug("  Dst: %s:%u\n", inet_ntoa(*(const struct in_addr *)&packet->ip.dest_addr), ntohs(packet->udp.dest));
 
         handle_tftp(handle, packet, pkt_len);
     }
-    else if (eth_ip->ip.protocol == IPV4_PROTOCOL_ICMP)
+    else if (ipv4_pkt->ip.protocol == IPV4_PROTOCOL_ICMP)
     {
+        const struct icmp_packet *icmp_pkt = (const struct icmp_packet *)pkt;
+#ifndef SPOOF_NON_VLAN
+        if (icmp_pkt->eth.vlan_tci == (uint16_t)-1)
+        {
+            debug("  Ignoring non VLAN ICMP packet");
+            return;
+        }
+#endif
+
         if (pkt_len < sizeof(struct icmp_packet))
         {
             debug("  Too short for ICMP.\n");
             return;
         }
 
+        if (icmp_pkt->icmp.type != ICMP_ECHO_REQUEST)
+        {
+            debug("  Not Echo Request.\n");
+            return;
+        }
+
+        if (icmp_pkt->icmp.code != 0)
+        {
+            debug("  Not Echo Request code 0.\n");
+            return;
+        }
+
+#ifdef VALIDATE_CHECKSUM
+        if (icmp_pkt->icmp.checksum != 0 && ipv4_checksum(&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet)) != 0)
+        {
+            debug("  Invalid ICMP checksum.\n");
+            return;
+        }
+#endif
+
         debug("  ICMP Packet.\n");
 
-        send_icmp_reply(handle, (const struct icmp_packet *)pkt, pkt_len);
+        send_icmp_reply(handle, icmp_pkt, pkt_len);
     }
     else
     {
@@ -132,6 +242,58 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     }
 
     return;
+}
+
+static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_len)
+{
+    int rc = 0;
+
+    uint32_t *pkt = (uint32_t *)eth;
+
+    // Print Packet Content
+#ifdef DEBUG_PACKET
+    size_t i = 0;
+    while (i < pkt_len && i < 64)
+    {
+        printf("%02X ", ((u_char *)pkt)[i++]);
+        if (i % 16 == 0)
+            printf("\n");
+    }
+    printf("\n---\n");
+#endif
+
+    if (pkt[0] == (uint32_t)-1)
+    {
+        pkt++;
+        pkt_len -= 4;
+    }
+    else if (eth->vlan_tci == (uint16_t)-1)
+    {
+        // Untagged, need to remove VLAN header
+        // memmove(pkt + 1, pkt, sizeof(struct eth_base));
+        pkt[3] = pkt[2];
+        pkt[2] = pkt[1];
+        pkt[1] = pkt[0];
+        pkt[0] = (uint32_t)-1;
+        pkt++;
+        pkt_len -= 4;
+    }
+
+    rc = pcap_sendpacket(handle, (const u_char *)pkt, pkt_len);
+
+#ifdef DEBUG_PACKET
+    // Print Packet Content
+    i = 0;
+    while (i < pkt_len && i < 64)
+    {
+        printf("%02X ", ((u_char *)pkt)[i++]);
+        if (i % 16 == 0)
+            printf("\n");
+    }
+    printf("\n");
+#endif
+
+    return rc;
 }
 
 int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet_len)
@@ -151,7 +313,7 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         packet->ip.checksum = 0; // Important: clear before computing
         packet->ip.checksum = ipv4_checksum((const void *)&packet->ip, sizeof(struct ipv4_header));
 
-        if (pcap_sendpacket(handle, (const u_char *)packet, packet_len) != 0)
+        if (send_via_pcap(handle, (struct eth_header *)packet, packet_len) != 0)
         {
             debug("    Error sending the packet\n");
             return -1;
@@ -165,9 +327,10 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
     uint32_t remaining = ip_total - sizeof(struct ipv4_header);
     uint32_t offset_bytes = 0;
     struct ipv4_packet *packet_fragment = NULL;
-    
+
     packet_fragment = (struct ipv4_packet *)malloc(sizeof(struct ipv4_packet) + mtu_payload);
-    if (packet_fragment == NULL) {
+    if (packet_fragment == NULL)
+    {
         debug("    Error: out of memory for fragmentation\n");
         return -1;
     }
@@ -190,7 +353,8 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
             frag_payload = mtu_payload;
             /* reduce to multiple of 8 */
             frag_payload -= (frag_payload % 8);
-            if (frag_payload == 0) {
+            if (frag_payload == 0)
+            {
                 /* Cannot make progress */
                 debug("    Error: MTU too small for fragmentation\n");
                 free(packet_fragment);
@@ -204,7 +368,7 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         /* Flags/offset: MF bit if more fragments, offset in 8-byte units */
         uint16_t fo = (uint16_t)((more_fragments ? 0x2000 : 0x0000) | ((offset_bytes / 8) & 0x1FFF));
         packet_fragment->ip.flags_offset = htons(fo);
-        
+
         packet_fragment->ip.checksum = 0;
         packet_fragment->ip.checksum = ipv4_checksum(&packet_fragment->ip, sizeof(struct ipv4_header));
 
@@ -212,7 +376,7 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         memcpy((uint8_t *)&packet_fragment->data, (uint8_t *)&packet->data + offset_bytes, frag_payload);
 
         /* Send fragment */
-        if (pcap_sendpacket(handle, (const u_char *)packet_fragment, sizeof(struct ipv4_packet) + frag_payload) != 0)
+        if (send_via_pcap(handle, (struct eth_header *)packet_fragment, sizeof(struct ipv4_packet) + frag_payload) != 0)
         {
             debug("    Error sending fragment (offset %u)\n", offset_bytes);
             /* continue attempting remaining fragments? abort */
@@ -252,19 +416,22 @@ static inline void handle_arp(pcap_t *handle, const struct arp_packet *arp_packe
         return;
     }
 
-    if (ntohs(arp_packet->arp.hw_type) != ARP_HW_TYPE_ETHERNET) {
+    if (ntohs(arp_packet->arp.hw_type) != ARP_HW_TYPE_ETHERNET)
+    {
         debug("  Unsupported ARP hardware type: 0x%04x\n", ntohs(arp_packet->arp.hw_type));
         return;
     }
 
-    if (ntohs(arp_packet->arp.protocol_type) != ETHERTYPE_IPV4) {
+    if (ntohs(arp_packet->arp.protocol_type) != ETHERTYPE_IPV4)
+    {
         debug("  Unsupported ARP protocol type: 0x%04x\n", ntohs(arp_packet->arp.protocol_type));
         return;
     }
 
-    if (arp_packet->arp.hw_size != 6 || arp_packet->arp.protocol_size != 4) {
+    if (arp_packet->arp.hw_size != 6 || arp_packet->arp.protocol_size != 4)
+    {
         debug("  Unexpected ARP hw/proto sizes: hw_size=%u proto_size=%u\n",
-            (unsigned)arp_packet->arp.hw_size, (unsigned)arp_packet->arp.protocol_size);
+              (unsigned)arp_packet->arp.hw_size, (unsigned)arp_packet->arp.protocol_size);
         return;
     }
 
@@ -281,16 +448,16 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
     // Ethernet Headers
     memcpy(arp_reply.eth.dest_mac, arp_req->eth.src_mac, sizeof(arp_reply.eth.dest_mac));
     memcpy(arp_reply.eth.src_mac, MY_MAC, sizeof(arp_reply.eth.src_mac));
-#ifdef USE_VLAN
+    // #ifdef USE_VLAN
     arp_reply.eth.vlan_tpid = htons(ETHERTYPE_VLAN);
     arp_reply.eth.vlan_tci = arp_req->eth.vlan_tci;
-#endif
+    // #endif
     arp_reply.eth.ethertype = htons(ETHERTYPE_ARP);
 
     // ARP Headers
     arp_reply.arp.hw_type = htons(ARP_HW_TYPE_ETHERNET);
     arp_reply.arp.protocol_type = htons(ETHERTYPE_IPV4);
-    arp_reply.arp.hw_size = sizeof(arp_reply.arp.sender_mac); // MAC size
+    arp_reply.arp.hw_size = sizeof(arp_reply.arp.sender_mac);      // MAC size
     arp_reply.arp.protocol_size = sizeof(arp_reply.arp.sender_ip); // IPv4 size
     arp_reply.arp.opcode = htons(ARP_REPLY);
     memcpy(arp_reply.arp.sender_mac, MY_MAC, sizeof(arp_reply.arp.sender_mac));
@@ -309,7 +476,7 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
     // }
     // printf("\n");
 
-    if (pcap_sendpacket(handle, (const uint8_t *)&arp_reply, sizeof(arp_reply)) != 0)
+    if (send_via_pcap(handle, (struct eth_header *)&arp_reply, sizeof(arp_reply)) != 0)
     {
         fprintf(stderr, "  Error sending ARP reply: %s\n", pcap_geterr(handle));
     }
@@ -321,13 +488,6 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 {
     struct icmp_packet *icmp_reply = NULL;
     size_t icmp_data_len = pkt_len - sizeof(struct icmp_packet);
-    uint16_t received_checksum = icmp_pkt->icmp.checksum;
-
-    if (icmp_pkt->icmp.type != ICMP_ECHO_REQUEST)
-    {
-        debug("  Not Echo Request.\n");
-        return;
-    }
 
     if (icmp_data_len > ICMP_MAX_DATA)
     {
@@ -336,32 +496,21 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     }
 
     /* Build the reply in icmp_reply directly (no temporary buffer). */
-    icmp_reply = malloc(sizeof(struct icmp_packet) + icmp_data_len);
-    if (icmp_reply == NULL) {
+    icmp_reply = (struct icmp_packet *)malloc(pkt_len);
+    if (icmp_reply == NULL)
+    {
         fprintf(stderr, "  Memory allocation failed for ICMP reply.\n");
         return;
     }
     // Copy entire original packet, along with data
-    memcpy(icmp_reply, icmp_pkt, sizeof(struct icmp_packet) + icmp_data_len);
-
-
-    /* validate received checksum */
-    received_checksum = icmp_reply->icmp.checksum;
-    icmp_reply->icmp.checksum = 0;
-    if (received_checksum != 0 && 
-        ipv4_checksum(&icmp_reply->icmp, sizeof(struct icmp_header) + icmp_data_len) != received_checksum)
-    {
-        debug("  Invalid ICMP checksum.\n");
-        free(icmp_reply);
-        return;
-    }
+    memcpy(icmp_reply->data, icmp_pkt->data, icmp_data_len);
 
     // ICMP Headers
     icmp_reply->icmp.type = ICMP_ECHO_REPLY; // Echo Reply
     icmp_reply->icmp.code = 0;
     icmp_reply->icmp.checksum = 0; // Needs to be calculated
-    icmp_reply->icmp.identifier = icmp_pkt->icmp.identifier;
-    icmp_reply->icmp.sequence = icmp_pkt->icmp.sequence;
+    // icmp_reply->icmp.identifier = icmp_pkt->icmp.identifier;
+    // icmp_reply->icmp.sequence = icmp_pkt->icmp.sequence;
 
     icmp_reply->icmp.checksum = ipv4_checksum(&icmp_reply->icmp, sizeof(struct icmp_header) + icmp_data_len);
 
@@ -382,10 +531,10 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     // Ethernet Headers
     memcpy(icmp_reply->eth.dest_mac, icmp_pkt->eth.src_mac, sizeof(icmp_reply->eth.dest_mac));
     memcpy(icmp_reply->eth.src_mac, MY_MAC, sizeof(icmp_reply->eth.src_mac));
-#ifdef USE_VLAN
+    // #ifdef USE_VLAN
     icmp_reply->eth.vlan_tpid = htons(ETHERTYPE_VLAN);
     icmp_reply->eth.vlan_tci = icmp_pkt->eth.vlan_tci;
-#endif
+    // #endif
     icmp_reply->eth.ethertype = htons(ETHERTYPE_IPV4);
 
     if (send_ipv4_packet(handle, (struct ipv4_packet *)icmp_reply, sizeof(struct icmp_packet) + icmp_data_len) != 0)
@@ -401,17 +550,20 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     return;
 }
 
-unsigned short ipv4_checksum(const void *buf, size_t len) {
+unsigned short ipv4_checksum(const void *buf, size_t len)
+{
     unsigned long sum = 0;
     const uint16_t *data = (const uint16_t *)buf;
 
     // Sum all 16-bit words
-    for (size_t i = 0; i < len / 2; i++) {
+    for (size_t i = 0; i < len / 2; i++)
+    {
         sum += ntohs(data[i]);
     }
 
     // If the header length is odd (shouldn't happen for IPv4), pad with zero
-    if (len & 1) {
+    if (len & 1)
+    {
         sum += ((const uint8_t *)buf)[len - 1] << 8;
     }
 
@@ -463,9 +615,50 @@ unsigned short udp_checksum(const struct ipv4_header *ip, const struct udp_heade
     return htons(~sum);
 }
 
-
 void print_mac(const uint8_t *mac)
 {
     printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+void print_ipv4(const struct ipv4_header *hdr)
+{
+    printf("    IP.version_ihl: 0x%02X\n", hdr->version_ihl);
+    printf("    IP.tos: 0x%02X\n", hdr->tos);
+    printf("    IP.total_length: %u\n", ntohs(hdr->total_length));
+    printf("    IP.id: %u\n", ntohs(hdr->id));
+    printf("    IP.flags_offset: 0x%04X\n", ntohs(hdr->flags_offset));
+    printf("    IP.ttl: %u\n", hdr->ttl);
+    printf("    IP.protocol: %u\n", hdr->protocol);
+    printf("    IP.checksum: 0x%04X\n", ntohs(hdr->checksum));
+    struct in_addr src_addr;
+    src_addr.s_addr = hdr->src_addr;
+    printf("    IP.src_addr: %s\n", inet_ntoa(src_addr));
+    struct in_addr dest_addr;
+    dest_addr.s_addr = hdr->dest_addr;
+    printf("    IP.dest_addr: %s\n", inet_ntoa(dest_addr));
+}
+
+void print_udp(const struct udp_header *hdr)
+{
+    printf("    UDP.source: %u\n", ntohs(hdr->source));
+    printf("    UDP.dest: %u\n", ntohs(hdr->dest));
+    printf("    UDP.len: %u\n", ntohs(hdr->len));
+    printf("    UDP.checksum: 0x%04X\n", ntohs(hdr->checksum));
+}
+
+void print_raw_data(const uint8_t *data, size_t len)
+{
+    size_t i;
+    printf("    ");
+    for (i = 0; i < len; i++)
+    {
+        printf("%02X ", data[i]);
+        if ((i + 1) % 16 == 0)
+            printf("\n    ");
+    }
+    if (len % 16 != 0)
+        printf("\n");
+    else
+        printf("\r\n");
 }

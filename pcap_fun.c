@@ -93,7 +93,8 @@ pcap_t *initialize_pcap()
     pcap_t *handle;
     char errbuf[PCAP_ERRBUF_SIZE];
     struct bpf_program filter;
-    char filter_exp[512] = "";
+    char filter_exp[1000] = "";
+    char filter_exp_part[400] = "";
     bpf_u_int32 net;
 
     int rc = 0;
@@ -155,7 +156,7 @@ pcap_t *initialize_pcap()
     {
         if (wcscmp(infos[i].name, L"Ethernet") == 0)
         {
-            infos[i].ip += 0x0e000000; // Force little-endian
+            //infos[i].ip += 0x0e000000; // Force little-endian
             rc = 1;
             wprintf(L"Auto-selected %ls, ", infos[i].name);
             printf("%s\n", inet_ntoa(*(struct in_addr *)&infos[i].ip));
@@ -188,6 +189,9 @@ pcap_t *initialize_pcap()
     
     dev = infos[i - 1].dev;
     memcpy(MY_MAC, infos[i - 1].mac, 6);
+#ifdef SPOOF_NON_VLAN
+    infos[i - 1].ip += 0x0e000000; // Force little-endian
+#endif
     MY_IP = ntohl(infos[i - 1].ip);
     net = infos[i - 1].ip_mask;
 
@@ -234,21 +238,21 @@ pcap_t *initialize_pcap()
 //     snprintf(filter_exp, sizeof(filter_exp), "udp and dst host %s", inet_ntoa(*(struct in_addr *)&infos[i - 1].ip));
 // #endif
 
-#ifdef USE_VLAN
-    snprintf(filter_exp, sizeof(filter_exp),
-             "vlan and ((arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or icmp[0] == 8 or (udp and dst host %s and (dst port 69 or (dst portrange %d-%d))))",
+// #ifdef USE_VLAN
+//     snprintf(filter_exp, sizeof(filter_exp),
+//              "vlan and ((arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or icmp[0] == 8 or (udp and dst host %s and (dst port 69 or (dst portrange %d-%d))))",
+//              (unsigned int)htonl(infos[i - 1].ip),
+//              inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), START_PORT, START_PORT + MAX_SESSIONS);
+// #else
+    snprintf(filter_exp_part, sizeof(filter_exp_part),
+             "(arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or (ip and dst host %s and ((icmp and icmp[0] = 8) or (udp and (udp dst port 69 or (udp dst portrange %d-%d)))))",
              (unsigned int)htonl(infos[i - 1].ip),
              inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), START_PORT, START_PORT + MAX_SESSIONS);
-#else
-    snprintf(filter_exp, sizeof(filter_exp),
-             // "udp and dst host %s and (dst port 69 or (dst portrange %d-%d))",
-             "(arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or (ip and dst host %s and ((icmp and icmp[0] == 8) or (udp and (udp dst port 69 or (udp dst portrange %d-%d)))))",
-             (unsigned int)htonl(infos[i - 1].ip),
-             inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), START_PORT, START_PORT + MAX_SESSIONS);
-#endif
+    snprintf(filter_exp, sizeof(filter_exp),"(%s) or (vlan and (%s))", filter_exp_part, filter_exp_part);
+// #endif
 
 
-    debug("\n  Filter: %s\n  ", filter_exp);
+    printf("\n  Filter: %s\n  ", filter_exp);
 
     if (pcap_compile(handle, &filter, filter_exp, 0, net) == -1 ||
         pcap_setfilter(handle, &filter) == -1)
