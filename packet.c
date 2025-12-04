@@ -143,6 +143,8 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     {
         debug("  IP length mismatch.\n");
         return;
+    } else {
+        pkt_len = ntohs(ipv4_pkt->ip.total_length) + sizeof(struct eth_header);
     }
 
     if (ipv4_pkt->ip.flags_offset & htons(0x3FFF))
@@ -162,6 +164,9 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     if (ipv4_pkt->ip.checksum != 0 && ipv4_checksum(&ipv4_pkt->ip, sizeof(ipv4_pkt->ip)) != 0)
     {
         debug("  Invalid checksum.\n");
+#ifdef DEBUG
+        print_ipv4(&ipv4_pkt->ip);
+#endif
         return;
     }
 #endif
@@ -227,7 +232,10 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 #ifdef VALIDATE_CHECKSUM
         if (icmp_pkt->icmp.checksum != 0 && ipv4_checksum(&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet)) != 0)
         {
+#ifdef DEBUG
             debug("  Invalid ICMP checksum.\n");
+            print_raw_data((const uint8_t *)&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet));
+#endif
             return;
         }
 #endif

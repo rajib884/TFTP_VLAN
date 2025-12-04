@@ -189,7 +189,7 @@ int tftp_send_packet(pcap_t *handle, struct tftp_session *session, int dummy)
         if (session->ack_received >= 0 && tpkt->udp.len != session->packet_header.udp.len) {
             session->last_packet = TRUE;
         }
-        debug("    Packet Sent (blk %lld, %u byte)!\n", session->block_number, ntohs(session->packet.udp.len));
+        debug("    Packet Sent (blk %lld, %u byte)!\n", session->block_number, ntohs(tpkt->udp.len));
     }
 
     session->last_send_tick = GetTickCount();
@@ -301,7 +301,7 @@ void session_check(pcap_t *handle)
 
     now = GetTickCount();
 
-    if (now - last_print_time > 3000) print = TRUE;
+    if (now - last_print_time > 5000) print = TRUE;
 
     // Check for TFTP session timeouts
     for (int i = 0; i < MAX_SESSIONS; ++i) 
@@ -343,6 +343,8 @@ void session_check(pcap_t *handle)
             }
         }
     }
+    
+    if (printed) printf("\n");
 }
 
 void close_session(struct tftp_session *session)
@@ -794,7 +796,7 @@ void tftp_prepare_packets(struct tftp_session *session)
         }
 
         offset = i * (uint64_t)session->block_size;
-        if (offset >= (uint64_t)session->file_size) break;
+        if (offset > (uint64_t)session->file_size) break;
         
         read_length = (size_t)((uint64_t)session->file_size - offset);
         if (read_length >= session->block_size)

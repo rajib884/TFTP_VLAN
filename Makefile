@@ -21,3 +21,5 @@ debug:
 
 clean:
 	cmd /C "if exist test.exe del /Q test.exe"
+
+# gcc -g -O0 -o debug main.c packet.c pcap_fun.c tftp.c queue.c -Wall -I "C:\Program Files\Npcap\Include" -I "include" -D_WIN32_WINNT=0x0600 -L "C:\Program Files\Npcap\Lib\x64" -lwpcap -lpacket -lws2_32 -liphlpapi -DVALIDATE_CHECKSUM -DDEBUG

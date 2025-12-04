@@ -46,8 +46,8 @@ struct tftp_session
     packet_queue_t *pkts;
     struct udp_packet packet_header;
     
-    struct tftp_packet packet;
-    uint32_t packet_length;
+    // struct tftp_packet packet;
+    // uint32_t packet_length;
 
     uint32_t retries; // Retransmission count
     uint32_t options_requested;
