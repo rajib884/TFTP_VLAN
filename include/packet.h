@@ -20,7 +20,6 @@
 #define START_PORT 20001 // Starting port for TFTP sessions
 #define MAX_SESSIONS 15 // Maximum concurrent TFTP sessions
 
-#define MAX_FILE_SIZE_TO_PREALLOCATE (50 * 1024 * 1024) // 50 MB
 #define MAX_PREALLOCATE (2 * MAX_WINDOWSIZE)
 
 #define INVALID_VLAN_TCI ((uint16_t)-1)

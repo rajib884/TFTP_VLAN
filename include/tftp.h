@@ -23,7 +23,6 @@ struct tftp_session
     char file_name[512];
     FILE *fd;
     long file_size;
-    uint8_t *file;
 
     int64_t ack_received;  // Last acknowledged block number
     int64_t block_number;  // Current block number

@@ -172,8 +172,8 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     // If checksum field is non-zero, validate it.
     if (ipv4_pkt->ip.checksum != 0 && ipv4_checksum(&ipv4_pkt->ip, sizeof(ipv4_pkt->ip)) != 0)
     {
-        debug("  Invalid checksum.\n");
 #ifdef DEBUG
+        debug("  Invalid checksum.\n");
         print_ipv4(&ipv4_pkt->ip);
 #endif
         return;
@@ -261,14 +261,21 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     return;
 }
 
+/**
+ * Send packet via pcap, handling VLAN header as needed.
+ * If the packet has VLAN TCI set to INVALID_VLAN_TCI (all 1s), the 
+ * VLAN header is removed before sending. For optimization, if the 
+ * packet already starts with 0xFFFFFFFF, it is assumed the VLAN 
+ * header is already removed.
+ */
 static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_len)
 {
     int rc = 0;
 
     uint32_t *pkt = (uint32_t *)eth;
 
+#if 0
     // Print Packet Content
-#ifdef DEBUG_PACKET
     size_t i = 0;
     while (i < pkt_len && i < 64)
     {
@@ -279,9 +286,11 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
     printf("\n---\n");
 #endif
 
-    if (pkt[0] == (uint32_t)-1)
+    // Check if VLAN header needs to be removed
+    if (pkt[0] == (uint32_t)-1) 
     {
-        pkt++;
+        // Already removed, move pointer forward by 4 bytes
+        pkt++; 
         pkt_len -= 4;
     }
     else if (eth->vlan_tci == INVALID_VLAN_TCI)
@@ -298,7 +307,7 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
 
     rc = pcap_sendpacket(handle, (const u_char *)pkt, pkt_len);
 
-#ifdef DEBUG_PACKET
+#if 0
     // Print Packet Content
     i = 0;
     while (i < pkt_len && i < 64)
@@ -313,6 +322,10 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
     return rc;
 }
 
+/**
+ * Send IPv4 packet via pcap, handling IP fragmentation if needed.
+ * Returns 0 on success, -1 on failure.
+ */
 int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet_len)
 {
     const int ETH_MTU = 1500; /* Ethernet MTU (bytes of IP packet payload) */
@@ -485,12 +498,6 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
     print_mac(arp_req->eth.src_mac);
 #endif
 
-    // for (i = 0; i < 64; i++){
-    //     if (i % 8 == 0) printf("\n");
-    //     printf("%02x ", arp_reply[i]);
-    // }
-    // printf("\n");
-
     if (send_via_pcap(handle, (struct eth_header *)&arp_reply, sizeof(arp_reply)) != 0)
     {
         fprintf(stderr, "  Error sending ARP reply: %s\n", pcap_geterr(handle));
@@ -546,10 +553,8 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     // Ethernet Headers
     memcpy(icmp_reply->eth.dest_mac, icmp_pkt->eth.src_mac, sizeof(icmp_reply->eth.dest_mac));
     memcpy(icmp_reply->eth.src_mac, MY_MAC, sizeof(icmp_reply->eth.src_mac));
-    // #ifdef USE_VLAN
     icmp_reply->eth.vlan_tpid = htons(ETHERTYPE_VLAN);
     icmp_reply->eth.vlan_tci = icmp_pkt->eth.vlan_tci;
-    // #endif
     icmp_reply->eth.ethertype = htons(ETHERTYPE_IPV4);
 
     if (send_ipv4_packet(handle, (struct ipv4_packet *)icmp_reply, sizeof(struct icmp_packet) + icmp_data_len) != 0)
