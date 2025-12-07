@@ -1,4 +1,4 @@
-# Makefile for building 'test' from raw.c with Npcap and Windows libraries
+# Makefile for building with Npcap and Windows libraries
 
 CC=gcc
 CFLAGS=-Wall -I "C:\Program Files\Npcap\Include" -I "include" -D_WIN32_WINNT=0x0600

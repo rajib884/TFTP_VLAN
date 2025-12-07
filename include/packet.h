@@ -23,6 +23,7 @@
 #define MAX_FILE_SIZE_TO_PREALLOCATE (50 * 1024 * 1024) // 50 MB
 #define MAX_PREALLOCATE (2 * MAX_WINDOWSIZE)
 
+#define INVALID_VLAN_TCI ((uint16_t)-1)
 #define ETHERTYPE_VLAN 0x8100
 #define ETHERTYPE_ARP 0x0806
 #define ETHERTYPE_IPV4 0x0800
@@ -79,10 +80,8 @@ struct eth_header
 {
     uint8_t dest_mac[6];
     uint8_t src_mac[6];
-// #ifdef USE_VLAN
     uint16_t vlan_tpid;
     uint16_t vlan_tci;
-// #endif
     uint16_t ethertype;
     uint8_t data[];
 };

@@ -221,75 +221,6 @@ static void tftp_send_error(pcap_t *handle, struct tftp_session *session)
     // close_session(session); // lets retry sending error then close
 }
 
-
-// // Helper: send OACK
-// static void tftp_send_oack(pcap_t *handle, struct tftp_session *session)
-// {
-//     size_t oack_len = 0;
-//     int rc = 0;
-
-//     if (session->options_requested & OPTIONS_TSIZE_REQUESTED){
-//         strcpy((char *)session->packet.tftp.oack.options, "tsize");
-//         oack_len += strlen("tsize") + 1;
-
-//         rc = sprintf((char *)(session->packet.tftp.oack.options + oack_len), "%ld", session->file_size);
-//         if (rc < 0) {
-//             printf("    Error formatting tsize value.\n");
-//             close_session(session);
-//         }
-//         oack_len += rc + 1;
-//     }
-
-//     // Add block size option if requested
-//     if (session->options_requested & OPTIONS_BLKSIZE_REQUESTED) {
-//         strcpy((char *)(session->packet.tftp.oack.options + oack_len), "blksize");
-//         oack_len += strlen("blksize") + 1;
-
-//         rc = sprintf((char *)(session->packet.tftp.oack.options + oack_len), "%d", session->block_size);
-//         if (rc < 0) {
-//             printf("    Error formatting blksize value.\n");
-//             close_session(session);
-//         }
-//         oack_len += rc + 1;
-//     }
-
-//     // Add timeout option if requested
-//     if (session->options_requested & OPTIONS_TIMEOUT_REQUESTED) {
-//         strcpy((char *)(session->packet.tftp.oack.options + oack_len), "timeout");
-//         oack_len += strlen("timeout") + 1;
-
-//         rc = sprintf((char *)(session->packet.tftp.oack.options + oack_len), "%d", session->timeout / 1000);
-//         if (rc < 0) {
-//             printf("    Error formatting timeout value.\n");
-//             close_session(session);
-//         }
-//         oack_len += rc + 1;
-//     }
-
-//     // Add windowsize option if requested
-//     if (session->options_requested & OPTIONS_WINDOWSIZE_REQUESTED) {
-//         strcpy((char *)(session->packet.tftp.oack.options + oack_len), "windowsize");
-//         oack_len += strlen("windowsize") + 1;
-
-//         rc = sprintf((char *)(session->packet.tftp.oack.options + oack_len), "%d", session->windowsize);
-//         if (rc < 0) {
-//             printf("    Error formatting timeout value.\n");
-//             close_session(session);
-//         }
-//         oack_len += rc + 1;
-//     }
-
-//     oack_len += 2; // opcode
-
-//     // Fill headers
-//     session->packet.tftp.opcode = htons(OPCODE_OACK);
-//     session->packet.udp.len = htons(sizeof(struct udp_header) + oack_len);
-//     session->packet.ip.total_length = htons(sizeof(struct ipv4_header) + sizeof(struct udp_header) + oack_len);
-//     session->packet_length = sizeof(struct udp_packet) + oack_len;
-
-//     tftp_send_packet(handle, session);
-// }
-
 void session_check(pcap_t *handle)
 {
     const int MAX_RETRIES = 5;
@@ -301,9 +232,10 @@ void session_check(pcap_t *handle)
 
     now = GetTickCount();
 
+    // If it has been more than 5s since last progress print, print progress
     if (now - last_print_time > 5000) print = TRUE;
 
-    // Check for TFTP session timeouts
+    // Check for TFTP session timeouts and print progress
     for (int i = 0; i < MAX_SESSIONS; ++i) 
     {
         s = &sessions[i];
@@ -349,8 +281,6 @@ void session_check(pcap_t *handle)
 
 void close_session(struct tftp_session *session)
 {
-    uint32_t session_id, success;
-    DWORD duration_ms;
     double duration_s;
     double transferred_mb;
 
@@ -358,15 +288,26 @@ void close_session(struct tftp_session *session)
         return;
     }
 
-    session_id = session->session_id;
-    success = session->last_packet;
-    duration_ms = GetTickCount() - session->created_at;
-    duration_s = duration_ms / 1000.0;
+    duration_s = (GetTickCount() - session->created_at) / 1000.0;
     transferred_mb = session->file_size / (1024.0 * 1024.0);
-    printf("Session %3u: avg. processing time %4f us/packet\n", 
-        session_id, 
+    
+    if (session->error_occurred)
+    {
+        printf(" Session %3u: Error[%u] %s\n", session->session_id, session->error_occurred & ~TFTP_ERROR_FLAG, session->error_text);
+    }
+    else if (session->last_packet)
+    {
+        printf("Session %3u: Complete (%5.3f MB/s)\n", session->session_id, transferred_mb / duration_s);
+    }
+    else
+    {
+        printf("Session %3u: Terminated\n", session->session_id);
+    }
+
+    printf("             Processing time %.4f us/packet\n",
         ((double)session->processing_time / processing_timer.frequency.QuadPart) * 1000000.0 / session->sent_packet_count
     );
+    debug("             Sent %llu packets\n", session->sent_packet_count);
 
     session->in_use = FALSE;
     if (session->fd) {
@@ -385,16 +326,6 @@ void close_session(struct tftp_session *session)
     }
 
     memset(session, 0, sizeof(*session));
-
-    if (success)
-    {
-        printf("Session %3u: Complete (%.2f MB/s)\n", session_id, transferred_mb / duration_s);
-        // printf("    Transferred %.2f MB in %.2f s (%.2f MB/s)\n", transferred_mb, duration_s, transferred_mb / duration_s);
-    }
-    else
-    {
-        printf("Session %3u: Terminated\n", session_id);
-    }
 
     return;
 }
@@ -582,7 +513,7 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
     session->packet_header.ip.dest_addr = session->client_ip;
 
     // Ethernet Headers
-    if (session->vlan_id == (uint16_t)-1)
+    if (session->vlan_id == INVALID_VLAN_TCI)
     {
         struct eth_mover *mover = (struct eth_mover *)&session->packet_header;
         mover->padding = (uint32_t)-1;
@@ -873,101 +804,10 @@ void tftp_send_packets(pcap_t *handle, struct tftp_session *session)
 
     if (!session->last_packet)
         tftp_prepare_packets(session);
+    timer_start(&processing_timer);
 
     return;
 }
-
-// int tftp_send_data(pcap_t *handle, struct tftp_session *session)
-// {
-//     size_t read_length = 0;
-
-//     if (session == NULL || !session->in_use) {
-//         printf("    Invalid session.\n");
-//         return FALSE;
-//     }
-
-//     if (session->fd == NULL && session->file == NULL) {
-//         tftp_send_error(handle, session);
-//         return FALSE;
-//     }
-
-//     if (session->ack_received == -1) {
-//         tftp_send_oack(handle, session);
-//         return FALSE;
-//     }
-
-//     // session->packet.tftp.data.opcode = htons(OPCODE_DATA);
-
-//     // // Read file data
-//     // if (session->file != NULL)
-//     // {
-//     //     uint64_t offset = (uint64_t)session->block_number * (uint64_t)session->block_size;
-//     //     if (offset >= (uint64_t)session->file_size)
-//     //     {
-//     //         printf("    Invalid offset %llu >= file_size %ld\n", (unsigned long long)offset, session->file_size);
-//     //         // Nothing left to send or invalid request — close session
-//     //         close_session(session);
-//     //         return FALSE;
-//     //     }
-
-//     //     size_t remaining = (size_t)((uint64_t)session->file_size - offset);
-//     //     read_length = remaining;
-//     //     if (read_length >= session->block_size)
-//     //         read_length = session->block_size;
-//     //     else {
-//     //         // last packet
-//     //         session->last_packet = TRUE;
-//     //     }
-
-//     //     if (read_length > sizeof(session->packet.tftp.data.data)) {
-//     //         debug("    Clamping read_length %zu to data buffer %zu\n", read_length, sizeof(session->packet.tftp.data.data));
-//     //         read_length = sizeof(session->packet.tftp.data.data);
-//     //     }
-
-//     //     memcpy(session->packet.tftp.data.data, session->file + offset, read_length);
-//     // } else if (session->fd != NULL) {
-//     //     long seek_offset = session->block_number * session->block_size;
-//     //     if (seek_offset < 0) {
-//     //         printf("    Negative seek offset %ld\n", seek_offset);
-//     //         close_session(session);
-//     //         return FALSE;
-//     //     }
-//     //     if (fseek(session->fd, seek_offset, SEEK_SET) != 0) {
-//     //         perror("    fseek()");
-//     //         close_session(session);
-//     //         return FALSE;
-//     //     }
-//     //     debug("    from %ld ", ftell(session->fd));
-//     //     read_length = fread(session->packet.tftp.data.data, 1, session->block_size, session->fd);
-//     //     debug("to %ld\n", ftell(session->fd));
-//     // }
-
-//     // if (read_length < session->block_size) {
-//     //     if (session->last_packet || feof(session->fd)) {
-//     //         session->last_packet = TRUE;
-//     //         debug("    Last packet to be sent.\n");
-//     //     } else if (ferror(session->fd)) {
-//     //         printf("    Error reading file.\n");
-//     //         perror("         server: fread()");
-            
-//     //         close_session(session);
-
-//     //         return FALSE;
-//     //     }
-//     // }
-
-//     // session->packet.tftp.data.block_number = htons(session->block_number + 1);
-//     // session->packet.udp.len = htons(sizeof(struct udp_header) + 4 + read_length);
-//     // session->packet.ip.total_length = htons(sizeof(struct udp_packet) + 4 + read_length - sizeof(struct eth_header));
-//     // session->packet_length = sizeof(struct udp_packet) + 4 + read_length;
-
-//     tftp_send_packet(handle, session);
-//     // Reset retry counter after a fresh send
-//     session->retries = 0;
-
-//     return TRUE;
-// }
-
 
 void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len)
 {

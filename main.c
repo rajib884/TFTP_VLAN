@@ -14,20 +14,25 @@ uint16_t ipv4_id = 1234; // Just a random starting point
 
 int main()
 {
-    int run = 1;
+    int run = TRUE;
+    pcap_t *handle;
+    
+    struct pcap_pkthdr *header;
+    const u_char *pkt_data;
+    int res;
 
     setlocale(LC_ALL, "");
     debug("Hello World!\n");
 
+    // Used to prevent multiple instance in the same device, even with multiple users
     HANDLE hMutex = CreateMutexA(NULL, TRUE, "Global\\BulBulTFTPMutex");
     
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        printf("Another instance is already running in this device.\n");
+        printf("Another instance is already running in this device.\nPress Enter to exit...\n");
         CloseHandle(hMutex);
+        getchar();
         return 1;
     }
-
-    pcap_t *handle;
 
     handle = initialize_pcap();
 
@@ -36,14 +41,8 @@ int main()
         goto cleanup;
     }
 
+
     printf("\nListening...\n");
-
-    // pcap_loop(handle, 0, packet_handler, (uint8_t *)handle);
-
-    // Custom loop for timeout/retry support
-    struct pcap_pkthdr *header;
-    const u_char *pkt_data;
-    int res;
 
     timer_init(&processing_timer);
 
@@ -75,8 +74,6 @@ int main()
 
         timer_start(&processing_timer);
         session_check(handle);
-
-        // Sleep(100); // avoid busy loop
     }
 
 cleanup:

@@ -12,7 +12,7 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 extern void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len);
 extern uint16_t ipv4_id;
 
-timer_t processing_timer;
+timer_t processing_timer; // only used to measure performance
 
 void timer_init(timer_t *timer)
 {
@@ -43,6 +43,15 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
     if (pkthdr->caplen < sizeof(struct eth_header))
         goto cleanup;
 
+    /* 
+     * This program is made to handle TFTP packets with VLAN,
+     * If the received packet is a VLAN packet, we continue as is.
+     * But if the packet is normal packet, it is converted into a
+     * VLAN packet with VLAN TCI to be all 1. When sending packet,
+     * If TCI is all 1, we again similarly remove the VLAN portion
+     * of the packet to make it normal ethernet packet. This will
+     * not interfere with VLAN packet because TCI all 1 is invalid.
+     */
     if (eth_b->ethertype == htons(ETHERTYPE_VLAN))
     {
         eth = (struct eth_header *)pkt;
@@ -62,7 +71,7 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
         memcpy((void *)eth->dest_mac, eth_b->dest_mac, sizeof(eth->dest_mac));
         memcpy((void *)eth->src_mac, eth_b->src_mac, sizeof(eth->src_mac));
         eth->vlan_tpid = htons(ETHERTYPE_VLAN);
-        eth->vlan_tci = (uint16_t)-1; // Untagged
+        eth->vlan_tci = INVALID_VLAN_TCI; // Untagged
         eth->ethertype = eth_b->ethertype;
     }
 
@@ -73,7 +82,7 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
         goto cleanup;
 
 #if 0 
-    /* gettimeofday causes segmentation fault */
+    /* gettimeofday causes segmentation fault randomly */
     static struct timeval tv;
     gettimeofday(&tv, NULL);
 
@@ -99,7 +108,7 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
     case ETHERTYPE_ARP:
         debug("ARP\n");
 #ifndef SPOOF_NON_VLAN
-        if (eth->vlan_tci == (uint16_t)-1) // Skip non VLAN ARP
+        if (eth->vlan_tci == INVALID_VLAN_TCI) // Skip non VLAN ARP
             break;
 #endif
         handle_arp(handle, (const struct arp_packet *)eth, pkt_len);
@@ -204,7 +213,7 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     {
         const struct icmp_packet *icmp_pkt = (const struct icmp_packet *)pkt;
 #ifndef SPOOF_NON_VLAN
-        if (icmp_pkt->eth.vlan_tci == (uint16_t)-1)
+        if (icmp_pkt->eth.vlan_tci == INVALID_VLAN_TCI)
         {
             debug("  Ignoring non VLAN ICMP packet");
             return;
@@ -275,7 +284,7 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
         pkt++;
         pkt_len -= 4;
     }
-    else if (eth->vlan_tci == (uint16_t)-1)
+    else if (eth->vlan_tci == INVALID_VLAN_TCI)
     {
         // Untagged, need to remove VLAN header
         // memmove(pkt + 1, pkt, sizeof(struct eth_base));
@@ -456,10 +465,8 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
     // Ethernet Headers
     memcpy(arp_reply.eth.dest_mac, arp_req->eth.src_mac, sizeof(arp_reply.eth.dest_mac));
     memcpy(arp_reply.eth.src_mac, MY_MAC, sizeof(arp_reply.eth.src_mac));
-    // #ifdef USE_VLAN
     arp_reply.eth.vlan_tpid = htons(ETHERTYPE_VLAN);
     arp_reply.eth.vlan_tci = arp_req->eth.vlan_tci;
-    // #endif
     arp_reply.eth.ethertype = htons(ETHERTYPE_ARP);
 
     // ARP Headers

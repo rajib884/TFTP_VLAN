@@ -6,7 +6,7 @@
 
 // Packet structure
 typedef struct {
-    int64_t index;      // Packet number (sorted)
+    int64_t index;       // Packet number (sorted)
     void *data;          // Packet data
     size_t data_len;     // Length of packet data
 } packet_t;
@@ -22,7 +22,7 @@ typedef struct queue_node {
 typedef struct {
     queue_node_t *head;
     queue_node_t *tail;
-    queue_node_t *cache; // For caching last accessed node
+    queue_node_t *cache; // For caching last accessed nodes next node
     uint64_t size;
     int64_t lowest_index;  // Track the lowest index for optimization
 } packet_queue_t;

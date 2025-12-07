@@ -6,8 +6,6 @@
 
 #include "queue.h"
 
-uint64_t queue_size(const packet_queue_t *queue);
-void queue_print(const packet_queue_t *queue);
 
 // Initialize an empty queue
 packet_queue_t* queue_init(void) {
@@ -153,13 +151,13 @@ const packet_t* queue_get(packet_queue_t *queue, int64_t index) {
 
     // Get head 
     if (queue->head->packet.index == index) {
-        queue->cache = queue->head;
+        queue->cache = queue->head->next;
         return &queue->head->packet;
     }
 
     // Get tail
     if (queue->tail->packet.index == index) {
-        queue->cache = queue->tail;
+        queue->cache = queue->tail->next;
         return &queue->tail->packet;
     }
 
@@ -168,7 +166,7 @@ const packet_t* queue_get(packet_queue_t *queue, int64_t index) {
         queue_node_t *current = queue->head;
         while (current) {
             if (current->packet.index == index) {
-                queue->cache = current;
+                queue->cache = current->next;
                 return &current->packet;
             }
             if (current->packet.index > index) {
@@ -277,107 +275,4 @@ void queue_free(packet_queue_t *queue) {
     }
     
     free(queue);
-}
-
-// Get the current size of the queue
-uint64_t queue_size(const packet_queue_t *queue) {
-    return queue ? queue->size : 0;
-}
-
-// Print queue contents (for debugging)
-void queue_print(const packet_queue_t *queue) {
-    if (!queue) {
-        printf("Queue is NULL\n");
-        return;
-    }
-    
-    printf("Queue (size: %llu, lowest_index: %lld): ", queue->size, queue->lowest_index);
-    
-    queue_node_t *current = queue->head;
-    while (current) {
-        printf("[%lld:%zu] ", current->packet.index, current->packet.data_len);
-        current = current->next;
-    }
-    printf("\n");
-}
-
-// Example usage and test
-int pp() {
-    printf("Packet Queue Library Test\n");
-    
-    // Initialize queue
-    packet_queue_t *queue = queue_init();
-    if (!queue) {
-        printf("Failed to initialize queue\n");
-        return -1;
-    }
-    
-    // Test data
-    char packet1[] = "Packet 1 data";
-    char packet2[] = "Packet 2 data";
-    char packet3[] = "Packet 3 data";
-    char packet4[] = "Packet 4 data";
-    
-    // Add packets
-    printf("\n1. Adding packets...\n");
-    queue_add(queue, 100, packet1, sizeof(packet1));
-    queue_add(queue, 102, packet2, sizeof(packet2));
-    queue_add(queue, 101, packet3, sizeof(packet3));  // Insert in middle
-    queue_add(queue, 103, packet4, sizeof(packet4));
-    queue_print(queue);
-    
-    // Get packets
-    printf("\n2. Getting packets...\n");
-    const packet_t *pkt = queue_get(queue, 101);
-    if (pkt) {
-        printf("Found packet %lld: %s (length: %zu)\n", 
-               pkt->index, (char*)pkt->data, pkt->data_len);
-    }
-    
-    pkt = queue_get(queue, 999); // Non-existent
-    if (!pkt) {
-        printf("Packet 999 not found (as expected)\n");
-    }
-    
-    // Delete packets
-    printf("\n3. Deleting packets...\n");
-    printf("Deleting packet 100 (head)...\n");
-    queue_delete(queue, 100);
-    queue_print(queue);
-    
-    printf("Deleting packet 102 (middle)...\n");
-    queue_delete(queue, 102);
-    queue_print(queue);
-    
-    printf("Deleting packet 103 (tail)...\n");
-    queue_delete(queue, 103);
-    queue_print(queue);
-    
-    // Test FIFO behavior with sequential indices
-    printf("\n4. Testing FIFO behavior...\n");
-    packet_queue_t *fifo_queue = queue_init();
-    
-    for (uint32_t i = 1; i <= 5; i++) {
-        char data[32];
-        snprintf(data, sizeof(data), "Data for packet %u", i);
-        queue_add(fifo_queue, i, data, strlen(data) + 1);
-    }
-    queue_print(fifo_queue);
-    
-    // Remove in FIFO order
-    while (fifo_queue->size > 0) {
-        uint32_t head_index = fifo_queue->head->packet.index;
-        const packet_t *head_pkt = queue_get(fifo_queue, head_index);
-        if (head_pkt) {
-            printf("Processing packet %lld: %s\n", head_pkt->index, (char*)head_pkt->data);
-        }
-        queue_delete(fifo_queue, head_index);
-    }
-    
-    // Cleanup
-    queue_free(queue);
-    queue_free(fifo_queue);
-    
-    printf("\nTest completed successfully!\n");
-    return 0;
 }
