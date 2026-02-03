@@ -32,7 +32,8 @@ uint64_t timer_elapsed_us(timer_t *timer)
 }
 
 void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8_t *pkt)
-{    pcap_t *handle = (pcap_t *)user;
+{
+    pcap_t *handle = (pcap_t *)user;
     const struct eth_base *eth_b = (const struct eth_base *)pkt;
     struct eth_header *eth;
     uint8_t needs_to_free = FALSE;
@@ -328,12 +329,17 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
  */
 int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet_len)
 {
-    const int ETH_MTU = 1500; /* Ethernet MTU (bytes of IP packet payload) */
+    /* Effective MTU for the IP packet depends on whether VLAN is tagged */
+    const int ETH_MTU = (packet->eth.vlan_tci != INVALID_VLAN_TCI) ? 1496 : 1500;
     uint16_t ip_total = ntohs(packet->ip.total_length);
+    int rc = 0;
 
     if (ip_total + sizeof(struct eth_header) != packet_len)
     {
-        debug("    Error Sending Packet: IP total length (%u) does not match packet length (%llu).\n", ip_total, packet_len - sizeof(struct eth_header));
+        debug("    Error Sending Packet: IP total length (%llu) does not match packet length (%u).\n", ip_total + sizeof(struct eth_header), packet_len);
+#ifdef DEBUG
+        print_ipv4(&packet->ip);
+#endif
         return -1;
     }
 
@@ -343,9 +349,9 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         packet->ip.checksum = 0; // Important: clear before computing
         packet->ip.checksum = ipv4_checksum((const void *)&packet->ip, sizeof(struct ipv4_header));
 
-        if (send_via_pcap(handle, (struct eth_header *)packet, packet_len) != 0)
+        if ((rc = send_via_pcap(handle, (struct eth_header *)packet, packet_len)) != 0)
         {
-            debug("    Error sending the packet\n");
+            debug("    Error sending the packet pcap_sendpacket[%d]\n", rc);
             return -1;
         }
 
@@ -365,11 +371,6 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         return -1;
     }
 
-    /* Copy ethernet header */
-    memcpy(&packet_fragment->eth, &packet->eth, sizeof(struct eth_header));
-
-    /* Copy IP header */
-    memcpy(&packet_fragment->ip, &packet->ip, sizeof(struct ipv4_header));
 
     /* Use same IP id for all fragments (already set on session->packet.ip.id) */
     while (remaining > 0)
@@ -393,6 +394,10 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
             more_fragments = 1;
         }
 
+        /* Copy the Ethernet and IP header */
+        memcpy(&packet_fragment->eth, &packet->eth, sizeof(struct eth_header));
+        memcpy(&packet_fragment->ip, &packet->ip, sizeof(struct ipv4_header));
+
         /* Build IP header for this fragment */
         packet_fragment->ip.total_length = htons((uint16_t)(sizeof(struct ipv4_header) + frag_payload));
         /* Flags/offset: MF bit if more fragments, offset in 8-byte units */
@@ -406,9 +411,12 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         memcpy((uint8_t *)&packet_fragment->data, (uint8_t *)&packet->data + offset_bytes, frag_payload);
 
         /* Send fragment */
-        if (send_via_pcap(handle, (struct eth_header *)packet_fragment, sizeof(struct ipv4_packet) + frag_payload) != 0)
+        if ((rc = send_via_pcap(handle, (struct eth_header *)packet_fragment, sizeof(struct ipv4_packet) + frag_payload)) != 0)
         {
-            debug("    Error sending fragment (offset %u)\n", offset_bytes);
+            debug("    Error sending fragment (offset %u, size %llu) pcap_sendpacket[%d]\n", offset_bytes, sizeof(struct ipv4_packet) + frag_payload, rc);
+#ifdef DEBUG
+            print_ipv4(&packet_fragment->ip);
+#endif
             /* continue attempting remaining fragments? abort */
             free(packet_fragment);
             return -1;
@@ -669,16 +677,27 @@ void print_udp(const struct udp_header *hdr)
 
 void print_raw_data(const uint8_t *data, size_t len)
 {
-    size_t i;
-    printf("    ");
-    for (i = 0; i < len; i++)
+    size_t i, j;
+
+    for (i = 0; i < len; i += 16)
     {
-        printf("%02X ", data[i]);
-        if ((i + 1) % 16 == 0)
-            printf("\n    ");
+        /* Hex part */
+        printf("    ");
+        for (j = 0; j < 16; j++)
+        {
+            if (i + j < len)
+                printf("%02X ", data[i + j]);
+            else
+                printf("   "); /* padding for last line */
+        }
+
+        /* ASCII part */
+        printf(" |");
+        for (j = 0; j < 16 && i + j < len; j++)
+        {
+            uint8_t c = data[i + j];
+            printf("%c", isprint(c) ? c : '.');
+        }
+        printf("|\n");
     }
-    if (len % 16 != 0)
-        printf("\n");
-    else
-        printf("\r\n");
 }

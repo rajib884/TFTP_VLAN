@@ -10,6 +10,9 @@
 struct tftp_session
 {
     uint32_t in_use;  // Whether this session is running or not
+#define TFTP_NOT_USING 0x00
+#define TFTP_SENDING   0x01
+#define TFTP_RECEIVING 0x02
     uint32_t session_id;  // Unique session identifier for debugging
 
     // Client and Server info
@@ -24,6 +27,7 @@ struct tftp_session
     FILE *fd;
     long file_size;
 
+    int64_t ack_sent;      // Last acknowledged data block number sent
     int64_t ack_received;  // Last acknowledged block number
     int64_t block_number;  // Current block number
 
@@ -43,6 +47,7 @@ struct tftp_session
     uint16_t block_size;  // Block size for data packets
     uint32_t timeout;  // Timeout duration in milliseconds
     uint32_t windowsize;  // Window size for block transfer
+    long tsize;
     
     packet_queue_t *pkts;  // Send Packet Queue
     struct udp_packet packet_header;  // Copy packet header from this
@@ -54,7 +59,7 @@ struct tftp_session
 #define OPTIONS_WINDOWSIZE_REQUESTED 0x08
 
     uint32_t retries; // Retransmission count
-    DWORD last_send_tick; // Windows tick count when last packet sent
+    DWORD last_activity; // Windows tick count when last packet sent
     DWORD created_at; // Windows tick count when session was created
     
     // Debug
