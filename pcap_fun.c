@@ -200,7 +200,7 @@ pcap_t *initialize_pcap()
 
     if (pcap_set_snaplen(handle, 65536) != 0 ||
         pcap_set_promisc(handle, 1) != 0 ||
-        pcap_set_timeout(handle, 500) != 0 ||
+        pcap_set_timeout(handle, 1) != 0 ||
         pcap_set_immediate_mode(handle, 1) != 0)
     {
         fprintf(stderr, "Error setting pcap options: %s\n", pcap_geterr(handle));

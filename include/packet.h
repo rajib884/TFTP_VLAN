@@ -247,6 +247,8 @@ void timer_start(timer_t* timer);
 uint64_t timer_elapsed_us(timer_t* timer);
 void timer_init(timer_t* timer);
 
+char *get_tftp_pkt_desc(const struct tftp_packet *tftp, int use_src);
+char *time_str();
 void print_mac(const uint8_t *mac);
 void print_ipv4(const struct ipv4_header *hdr);
 void print_udp(const struct udp_header *hdr);

@@ -82,35 +82,21 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
     if (ntohs(eth->vlan_tpid) != ETHERTYPE_VLAN)
         goto cleanup;
 
-#if 0 
-    /* gettimeofday causes segmentation fault randomly */
-    static struct timeval tv;
-    gettimeofday(&tv, NULL);
-
-    // Convert to local time
-    time_t sec = tv.tv_sec;
-    struct tm* tm_info = localtime(&sec);
-
-    char buffer[64];
-    strftime(buffer, sizeof(buffer), "%H:%M:%S", tm_info);
-
-    debug("\nCurrent time: %s.%06ld\n", buffer, tv.tv_usec);
-#endif
-
-    debug("\nReceived ");
+    debug("\n"); // debug("\nReceived ");
 
     switch (ntohs(eth->ethertype))
     {
     case ETHERTYPE_IPV4:
-        debug("IPv4 Packet\n");
         handle_ipv4(handle, (const uint8_t *)eth, pkt_len);
         break;
 
     case ETHERTYPE_ARP:
-        debug("ARP\n");
 #ifndef SPOOF_NON_VLAN
         if (eth->vlan_tci == INVALID_VLAN_TCI) // Skip non VLAN ARP
+        {
+            debug("%s: < ARP\n", time_str());
             break;
+        }
 #endif
         handle_arp(handle, (const struct arp_packet *)eth, pkt_len);
         break;
@@ -131,7 +117,7 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 {
     if (pkt_len < sizeof(struct ipv4_packet))
     {
-        debug("  Too short for IP.\n");
+        debug("%s: < IP: too short\n", time_str());
         return;
     }
 
@@ -139,19 +125,19 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 
     if (ntohl(ipv4_pkt->ip.dest_addr) != MY_IP)
     {
-        debug("  Not my IP.\n");
+        debug("%s: < IP: not mine\n", time_str());
         return;
     }
 
     if (ipv4_pkt->ip.version_ihl != 0x45) // IPv4 with no options
     {
-        debug("  Not supported.\n");
+        debug("%s: < IP: not supported\n", time_str());
         return;
     }
 
     if (ntohs(ipv4_pkt->ip.total_length) + sizeof(struct eth_header) > pkt_len)
     {
-        debug("  IP length mismatch.\n");
+        debug("%s: < IP: length mismatch\n", time_str());
         return;
     } else {
         pkt_len = ntohs(ipv4_pkt->ip.total_length) + sizeof(struct eth_header);
@@ -159,13 +145,13 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 
     if (ipv4_pkt->ip.flags_offset & htons(0x3FFF))
     {
-        debug("  Fragmented packet, not supported.\n");
+        debug("%s: < IP: fragmented\n", time_str());
         return;
     }
 
     if (ipv4_pkt->ip.ttl == 0)
     {
-        debug("  TTL expired.\n");
+        debug("%s: < IP: ttl expired\n", time_str());
         return;
     }
 
@@ -174,7 +160,7 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     if (ipv4_pkt->ip.checksum != 0 && ipv4_checksum(&ipv4_pkt->ip, sizeof(ipv4_pkt->ip)) != 0)
     {
 #ifdef DEBUG
-        debug("  Invalid checksum.\n");
+        debug("%s: < IP: checksum failed\n", time_str());
         print_ipv4(&ipv4_pkt->ip);
 #endif
         return;
@@ -187,26 +173,28 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 
         if (pkt_len < sizeof(struct udp_packet) + 4)
         {
-            debug("  Too short for TFTP.\n");
+            debug("%s: < UDP: too short\n", time_str());
             return;
         }
 
         if (ntohs(packet->udp.len) + sizeof(struct ipv4_packet) > pkt_len)
         {
-            debug("  UDP length mismatch.\n");
+            debug("%s: < UDP: length mismatch\n", time_str());
             return;
         }
 
 #ifdef VALIDATE_CHECKSUM
         if (packet->udp.checksum != 0 && udp_checksum(&ipv4_pkt->ip, &packet->udp) != 0)
         {
-            debug("  Invalid UDP checksum.\n");
+            debug("%s: < UDP: checksum mismatch\n", time_str());
             return;
         }
 #endif
 
-        debug("  Src: %s:%u\n", inet_ntoa(*(const struct in_addr *)&packet->ip.src_addr), ntohs(packet->udp.source));
-        debug("  Dst: %s:%u\n", inet_ntoa(*(const struct in_addr *)&packet->ip.dest_addr), ntohs(packet->udp.dest));
+        // debug("  Src: %s:%u\n", inet_ntoa(*(const struct in_addr *)&packet->ip.src_addr), ntohs(packet->udp.source));
+        // debug("  Dst: %s:%u\n", inet_ntoa(*(const struct in_addr *)&packet->ip.dest_addr), ntohs(packet->udp.dest));
+        
+        // debug("%s: < UDP: %s\n", time_str(), inet_ntoa(*(const struct in_addr *)&ipv4_pkt->ip.src_addr));
 
         handle_tftp(handle, packet, pkt_len);
     }
@@ -216,26 +204,26 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 #ifndef SPOOF_NON_VLAN
         if (icmp_pkt->eth.vlan_tci == INVALID_VLAN_TCI)
         {
-            debug("  Ignoring non VLAN ICMP packet");
+            debug("%s: < ICMP: non vlan\n", time_str());
             return;
         }
 #endif
 
         if (pkt_len < sizeof(struct icmp_packet))
         {
-            debug("  Too short for ICMP.\n");
+            debug("%s: < ICMP: too short\n", time_str());
             return;
         }
 
         if (icmp_pkt->icmp.type != ICMP_ECHO_REQUEST)
         {
-            debug("  Not Echo Request.\n");
+            debug("%s: < ICMP: not req\n", time_str());
             return;
         }
 
         if (icmp_pkt->icmp.code != 0)
         {
-            debug("  Not Echo Request code 0.\n");
+            debug("%s: < ICMP: code mismatch\n", time_str());
             return;
         }
 
@@ -243,20 +231,20 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
         if (icmp_pkt->icmp.checksum != 0 && ipv4_checksum(&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet)) != 0)
         {
 #ifdef DEBUG
-            debug("  Invalid ICMP checksum.\n");
+            debug("%s: < ICMP: checksum mismatch\n", time_str());
             print_raw_data((const uint8_t *)&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet));
 #endif
             return;
         }
 #endif
 
-        debug("  ICMP Packet.\n");
+        printf("%s: < ICMP: %s\n", time_str(), inet_ntoa(*(const struct in_addr *)&icmp_pkt->ip.src_addr));
 
         send_icmp_reply(handle, icmp_pkt, pkt_len);
     }
     else
     {
-        debug("  Unsupported Protocol.\n");
+        debug("%s: < IP: unknown protocol\n", time_str());
     }
 
     return;
@@ -438,43 +426,44 @@ static inline void handle_arp(pcap_t *handle, const struct arp_packet *arp_packe
 {
     if (pkt_len < sizeof(struct arp_packet))
     {
-        debug("  Too short for ARP.\n");
+        debug("%s: < ARP: too short\n", time_str());
         return;
     }
 
     if (ntohs(arp_packet->arp.opcode) != ARP_REQUEST)
     {
-        debug("  Not ARP_REQUEST.\n");
+        debug("%s: < ARP: not req\n", time_str());
         return;
     }
 
     if (ntohl(arp_packet->arp.target_ip) != MY_IP)
     {
-        debug("  Target (%s) is not my IP.\n", inet_ntoa(*(struct in_addr *)&arp_packet->arp.target_ip));
+        debug("%s: < ARP: for %s\n", time_str(), inet_ntoa(*(struct in_addr *)&arp_packet->arp.target_ip));
         return;
     }
 
     if (ntohs(arp_packet->arp.hw_type) != ARP_HW_TYPE_ETHERNET)
     {
-        debug("  Unsupported ARP hardware type: 0x%04x\n", ntohs(arp_packet->arp.hw_type));
+        debug("%s: < ARP: not eth\n", time_str());
         return;
     }
 
     if (ntohs(arp_packet->arp.protocol_type) != ETHERTYPE_IPV4)
     {
-        debug("  Unsupported ARP protocol type: 0x%04x\n", ntohs(arp_packet->arp.protocol_type));
+        debug("%s: < ARP: not IPv4\n", time_str());
         return;
     }
 
     if (arp_packet->arp.hw_size != 6 || arp_packet->arp.protocol_size != 4)
     {
-        debug("  Unexpected ARP hw/proto sizes: hw_size=%u proto_size=%u\n",
-              (unsigned)arp_packet->arp.hw_size, (unsigned)arp_packet->arp.protocol_size);
+        debug("%s: < ARP: invalid hw/proto\n", time_str());
         return;
     }
 
-    debug("  Src: %s\n", inet_ntoa(*(const struct in_addr *)&arp_packet->arp.sender_ip));
-    debug("  Dst: %s\n", inet_ntoa(*(const struct in_addr *)&arp_packet->arp.target_ip));
+    // debug("  Src: %s\n", inet_ntoa(*(const struct in_addr *)&arp_packet->arp.sender_ip));
+    // debug("  Dst: %s\n", inet_ntoa(*(const struct in_addr *)&arp_packet->arp.target_ip));
+    
+    printf("%s: < ARP: %s\n", time_str(), inet_ntoa(*(const struct in_addr *)&arp_packet->arp.sender_ip));
 
     send_arp_reply(handle, arp_packet);
 }
@@ -501,9 +490,11 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
     memcpy(arp_reply.arp.target_mac, arp_req->arp.sender_mac, sizeof(arp_reply.arp.target_mac));
     arp_reply.arp.target_ip = arp_req->arp.sender_ip;
 
-#ifdef DEBUG
+#if 0
     printf("  Sending ARP Reply to ");
     print_mac(arp_req->eth.src_mac);
+#else
+    printf("%s: > ARP: %s\n\n", time_str(), inet_ntoa(*(const struct in_addr *)&arp_reply.arp.target_ip));
 #endif
 
     if (send_via_pcap(handle, (struct eth_header *)&arp_reply, sizeof(arp_reply)) != 0)
@@ -521,7 +512,7 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 
     if (icmp_data_len > ICMP_MAX_DATA)
     {
-        debug("  ICMP data length (%zu) exceeds maximum allowed (%d).\n", icmp_data_len, ICMP_MAX_DATA);
+        debug("%s: > ICMP: data too big\n", time_str());
         return;
     }
 
@@ -529,6 +520,7 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     icmp_reply = (struct icmp_packet *)malloc(pkt_len);
     if (icmp_reply == NULL)
     {
+        debug("%s: > ICMP: malloc fail\n", time_str());
         fprintf(stderr, "  Memory allocation failed for ICMP reply.\n");
         return;
     }
@@ -565,13 +557,10 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     icmp_reply->eth.vlan_tci = icmp_pkt->eth.vlan_tci;
     icmp_reply->eth.ethertype = htons(ETHERTYPE_IPV4);
 
+    printf("%s: > ICMP: %s\n\n", time_str(), inet_ntoa(*(const struct in_addr *)&icmp_reply->ip.dest_addr));
     if (send_ipv4_packet(handle, (struct ipv4_packet *)icmp_reply, sizeof(struct icmp_packet) + icmp_data_len) != 0)
     {
-        debug("    Error sending ICMP packet\n");
-    }
-    else
-    {
-        debug("    ICMP Reply Sent!\n");
+        printf("    Error sending ICMP packet\n");
     }
 
     free(icmp_reply);
@@ -643,6 +632,78 @@ unsigned short udp_checksum(const struct ipv4_header *ip, const struct udp_heade
     return htons(~sum);
 }
 
+char *get_tftp_pkt_desc(const struct tftp_packet *tftp, int use_src)
+{
+    static char buf[256];
+    char opcode_buf[64];
+    char ipbuf[INET_ADDRSTRLEN];
+    const uint32_t *ip_addr = NULL;
+    uint16_t port = 0;
+    uint16_t vlan = 0;
+
+    if (ntohs(tftp->eth.vlan_tpid) == ETHERTYPE_VLAN && tftp->eth.vlan_tci != INVALID_VLAN_TCI) {
+        vlan = ntohs(tftp->eth.vlan_tci) & 0x0FFF;
+    }
+
+    ip_addr = use_src ? &tftp->ip.src_addr : &tftp->ip.dest_addr;
+    port = use_src ? ntohs(tftp->udp.source) : ntohs(tftp->udp.dest);
+    inet_ntop(AF_INET, ip_addr, ipbuf, sizeof(ipbuf));
+
+    switch (ntohs(tftp->tftp.opcode))
+    {
+    case OPCODE_RRQ:
+        snprintf(opcode_buf, sizeof(opcode_buf), "RRQ");
+        break;
+
+    case OPCODE_WRQ:
+        snprintf(opcode_buf, sizeof(opcode_buf), "WRQ");
+        break;
+
+    case OPCODE_DATA:
+        snprintf(opcode_buf, sizeof(opcode_buf), "DATA[%u]", ntohs(tftp->tftp.data.block_number));
+        break;
+
+    case OPCODE_ACK:
+        snprintf(opcode_buf, sizeof(opcode_buf), "ACK[%u]", ntohs(tftp->tftp.ack.block_number));
+        break;
+
+    case OPCODE_ERROR:
+        snprintf(opcode_buf, sizeof(opcode_buf), "ERR[%u]", ntohs(tftp->tftp.error.error_code));
+        break;
+
+    case OPCODE_OACK:
+        snprintf(opcode_buf, sizeof(opcode_buf), "OACK");
+        break;
+
+    default:
+        snprintf(opcode_buf, sizeof(opcode_buf), "UNK");
+        break;
+    }
+
+    if (vlan)
+        snprintf(buf, sizeof(buf), "[v%u]%s:%u %s", vlan, ipbuf, port, opcode_buf);
+    else
+        snprintf(buf, sizeof(buf), "%s:%u %s", ipbuf, port, opcode_buf);
+
+    return buf;
+}
+
+char *time_str()
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    static char buf[128];
+
+#if 0
+    snprintf(buf, sizeof(buf), "%04d/%02d/%02d %02d:%02d:%02d.%03d", st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+#else
+    snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%03u",
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+#endif
+    return buf;
+}
+
 void print_mac(const uint8_t *mac)
 {
     printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -678,12 +739,24 @@ void print_udp(const struct udp_header *hdr)
 void print_raw_data(const uint8_t *data, size_t len)
 {
     size_t i, j;
+    const size_t BREAK_AFTER = 256;
+    const size_t PER_ROW = 16;
 
-    for (i = 0; i < len; i += 16)
+    if (len > BREAK_AFTER) 
+    {
+        print_raw_data(data, BREAK_AFTER);
+        i = BREAK_AFTER * (len / BREAK_AFTER);
+        if (i == len) i -= BREAK_AFTER;
+        printf("    ");
+        for (j = 0; j < PER_ROW; j++) printf("----");
+        printf("---\n");
+    } else i = 0;
+
+    for (; i < len; i += PER_ROW)
     {
         /* Hex part */
         printf("    ");
-        for (j = 0; j < 16; j++)
+        for (j = 0; j < PER_ROW; j++)
         {
             if (i + j < len)
                 printf("%02X ", data[i + j]);
@@ -693,10 +766,10 @@ void print_raw_data(const uint8_t *data, size_t len)
 
         /* ASCII part */
         printf(" |");
-        for (j = 0; j < 16 && i + j < len; j++)
+        for (j = 0; j < PER_ROW && i + j < len; j++)
         {
             uint8_t c = data[i + j];
-            printf("%c", isprint(c) ? c : '.');
+            printf("%c", (c >= 0x20 && c <= 0x7E) ? c : '.');
         }
         printf("|\n");
     }

@@ -6,13 +6,15 @@
 
 #include "packet.h"
 #include "queue.h"
+#include "ftp_handler.h"
 
 struct tftp_session
 {
     uint32_t in_use;  // Whether this session is running or not
-#define TFTP_NOT_USING 0x00
-#define TFTP_SENDING   0x01
-#define TFTP_RECEIVING 0x02
+#define TFTP_NOT_USING   0x00
+#define TFTP_SENDING     0x01
+#define TFTP_RECEIVING   0x02
+#define TFTP_FTP_SENDING 0x04
     uint32_t session_id;  // Unique session identifier for debugging
 
     // Client and Server info
@@ -26,6 +28,9 @@ struct tftp_session
     char file_name[512];
     FILE *fd;
     long file_size;
+
+    // FTP
+    ftp_download_t *ftp;
 
     int64_t ack_sent;      // Last acknowledged data block number sent
     int64_t ack_received;  // Last acknowledged block number

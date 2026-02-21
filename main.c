@@ -6,6 +6,7 @@
 #include "pcap_fun.h"
 #include "packet.h"
 #include "tftp.h"
+#include "ftp_handler.h"
 
 uint8_t MY_MAC[6] = {0};
 uint32_t MY_IP = 0;
@@ -17,6 +18,12 @@ int main()
     int run = TRUE;
     pcap_t *handle;
     
+    /* Event handles array: [0] = pcap, [1..MAX_FTP_DOWNLOADS] = FTP sockets */
+    HANDLE waitHandles[1 + MAX_FTP_DOWNLOADS];
+    int totalHandles;
+    long timeout_ms;
+    DWORD rc;
+
     struct pcap_pkthdr *header;
     const u_char *pkt_data;
     int res;
@@ -34,6 +41,13 @@ int main()
         return 1;
     }
 
+    if (ftp_handler_init() != 0)
+    {
+        printf("FTP handler init failed\n");
+        return 1;
+    }
+
+
     handle = initialize_pcap();
 
     if (handle == NULL){
@@ -41,6 +55,12 @@ int main()
         goto cleanup;
     }
 
+    waitHandles[0] = pcap_getevent(handle);
+    if (!waitHandles[0])
+    {
+        printf("Failed to get pcap event handle\n");
+        goto cleanup;
+    }
 
     printf("\nListening...\n");
 
@@ -48,31 +68,54 @@ int main()
 
     while (run)
     {
-        res = pcap_next_ex(handle, &header, &pkt_data);
+        /* Get current event handles and recommended timeout from FTP */
+        totalHandles = 1 + ftp_get_event_handles(&waitHandles[1], MAX_FTP_DOWNLOADS);
+        timeout_ms = ftp_get_timeout_ms(1000);
+        rc = WaitForMultipleObjects(totalHandles, waitHandles, FALSE, timeout_ms);
 
-        switch (res)
+        if (rc == WAIT_OBJECT_0)
         {
-        case 1: // Got a packet
-            packet_handler((uint8_t *)handle, header, pkt_data);
-            break;
+            /* pcap has packets */
+            while ((res = pcap_next_ex(handle, &header, &pkt_data)) == 1)
+            {
+                packet_handler((uint8_t *)handle, header, pkt_data);
+            }
 
-        case 0: // Timeout, fall through to check sessions
-            break;
+            switch (res)
+            {
+            case 0: // Timeout
+                break;
 
-        case -1: // Error
-            printf("Error reading packet: %s\n", pcap_geterr(handle));
-            break;
+            case -1: // Error
+                printf("Error reading packet: %s\n", pcap_geterr(handle));
+                break;
 
-        case -2: // EOF
-            run = 0;
-            printf("End of packet capture.\n");
-            break;
+            case -2: // EOF
+                run = FALSE;
+                printf("End of packet capture.\n");
+                break;
 
-        default:
+            default:
+                break;
+            }
+        }
+        else if (rc >= WAIT_OBJECT_0 + 1 && rc < WAIT_OBJECT_0 + totalHandles)
+        {
+            /* One of the FTP sockets has activity */
+        }
+        else if (rc == WAIT_TIMEOUT)
+        {
+            /* Periodic tasks */
+        }
+        else
+        {
+            printf("WaitForMultipleObjects failed: %lu\n", GetLastError());
+            run = FALSE;
             break;
         }
 
         timer_start(&processing_timer);
+        ftp_download_poll();
         session_check(handle);
     }
 
@@ -82,6 +125,7 @@ cleanup:
     if (handle != NULL) {
         pcap_close(handle);
     }
+    ftp_handler_cleanup();
     ReleaseMutex(hMutex);
     CloseHandle(hMutex);
 
