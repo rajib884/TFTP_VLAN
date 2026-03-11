@@ -1,4 +1,11 @@
 #include "tftp.h"
+#include "cli_config.h"
+#include "fast_log.h"
+
+#include <winsock2.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 
 struct tftp_session sessions[MAX_SESSIONS] = {0};
 
@@ -9,12 +16,15 @@ void tftp_send_packets(pcap_t *handle, struct tftp_session *session);
 void tftp_receive_data(pcap_t *handle, struct tftp_session *session, const struct tftp_packet *pkt, uint32_t pkt_len);
 int tftp_prepare_oack(struct tftp_session *session);
 
+extern cli_config_t config;
+
 // Helper: set tftp error
 static inline void tftp_set_error(struct tftp_session *session, int errcode, const char *errmsg)
 {
     session->error_occurred = errcode;
     strncpy(session->error_text, errmsg, sizeof(session->error_text) - 1);
     session->error_text[sizeof(session->error_text) - 1] = '\0';
+    LOG_PRINTF(LOG_ERROR, "%s: * TFTP[s%u]: %s[Error]%s %s\n", time_str(), session->session_id, CLR_RED, CLR_RESET, session->error_text);
 }
 
 // Helper: parse options
@@ -126,9 +136,12 @@ static int parse_options(const uint8_t *buf, size_t maxlen, struct tftp_session 
     }
 
     // Limit options
-    if (session->block_size < MIN_BLOCK_SIZE || session->block_size > MAX_BLOCK_SIZE) {
+    if (config.force_block_size){
+        session->block_size = config.force_block_size;
+        session->options_requested |= OPTIONS_BLKSIZE_REQUESTED;
+    } else if (session->block_size < MIN_BLOCK_SIZE || session->block_size > config.max_block_size) {
         debug("%s: * TFTP:     Invalid block size requested (%d), using default %d.\n", time_str(), session->block_size, DEFAULT_BLOCK_SIZE);
-        session->block_size = DEFAULT_BLOCK_SIZE;
+        session->block_size = config.default_block_size;
     }
 
     if (session->timeout < MIN_TIMEOUT || session->timeout > MAX_TIMEOUT) {
@@ -154,10 +167,46 @@ static int parse_options(const uint8_t *buf, size_t maxlen, struct tftp_session 
     return 0;
 }
 
-int tftp_is_ftp_url(const char *url)
+int tftp_is_ftp_url(struct tftp_session *session)
 {
-    if (url == NULL)
+    if (session == NULL)
         return 0;
+
+    char *url = session->file_name;
+    const char CUSTOM_PREFIX[] = "f::";
+    const char EXPAND_FMT[] = "ftp://share:shared@192.168.90.22/BDCOM%04u/%s";
+
+    // Expand custom prefix 
+    if (strncasecmp(url, CUSTOM_PREFIX, sizeof(CUSTOM_PREFIX) - 1) == 0)
+    {
+        const char *path = url + sizeof(CUSTOM_PREFIX) - 1;
+        const char *slash = strchr(path, '/');
+        if (!slash) return 0;
+
+        // Extract the ID part
+        char id_str[16];
+        size_t id_len = slash - path;
+        if (id_len == 0 || id_len >= sizeof(id_str)) return 0;
+
+        memcpy(id_str, path, id_len);
+        id_str[id_len] = '\0';
+
+        char *endptr;
+        unsigned long id = strtoul(id_str, &endptr, 10);
+        if (*endptr != '\0' || id > UINT_MAX)  return 0;
+
+        // Extract the File part
+        const char *file_part = slash + 1;
+        if (*file_part == '\0') return 0;
+
+        // Expand and update
+        char new_url[sizeof(session->file_name)];
+        int written = snprintf(new_url, sizeof(new_url), EXPAND_FMT, (unsigned int)id, file_part);
+        if (written < 0 || written >= (int)sizeof(new_url)) return 0;
+
+        snprintf(session->file_name, sizeof(session->file_name), "%s", new_url);
+    }
+
     /* ftp:// or ftps:// (case-insensitive) */
     if (strncasecmp(url, "ftp://", 6) == 0)
         return 1;
@@ -193,7 +242,7 @@ int tftp_send_packet(pcap_t *handle, struct tftp_session *session, const packet_
         //printf("PT: %lld us\n", timer_elapsed_us(&processing_timer));
     } else {
 #ifdef DEBUG
-        printf("First packet sent in: %0.2f us\n", (double)timer_elapsed_us(&processing_timer) * 1000000.0 / processing_timer.frequency.QuadPart );
+        LOG_PRINTF(LOG_DEBUG, "First packet sent in: %0.2f us\n", (double)timer_elapsed_us(&processing_timer) * 1000000.0 / processing_timer.frequency.QuadPart );
         print_ipv4(&((struct ipv4_packet *)pkt->data)->ip);
         print_udp(&((struct tftp_packet *)pkt->data)->udp);
         print_raw_data((const uint8_t *)&((struct tftp_packet *)pkt->data)->tftp, pkt->data_len - sizeof(struct udp_packet));
@@ -202,20 +251,19 @@ int tftp_send_packet(pcap_t *handle, struct tftp_session *session, const packet_
     session->sent_packet_count += 1;
 
     if (
-#ifdef DEBUG 
-        1 || 
-#endif 
         (ntohs(tpkt->tftp.opcode) == OPCODE_ERROR) || 
         (ntohs(tpkt->tftp.opcode) == OPCODE_OACK) || 
-        (ntohs(tpkt->tftp.opcode) == OPCODE_ACK && ntohs(tpkt->tftp.ack.block_number) <= 1) || 
-        (ntohs(tpkt->tftp.opcode) == OPCODE_DATA && ntohs(tpkt->tftp.data.block_number) <= 1)
+        (ntohs(tpkt->tftp.opcode) == OPCODE_ACK && ntohs(tpkt->tftp.ack.block_number) <= 2) || 
+        (ntohs(tpkt->tftp.opcode) == OPCODE_DATA && ntohs(tpkt->tftp.data.block_number) <= 2)
     ){
-        printf("%s: > TFTP: %s\n", time_str(), get_tftp_pkt_desc(tpkt, FALSE));
+        LOG_PRINTF(LOG_INFO, "%s: > TFTP: %s\n\n", time_str(), get_pkt_str(tpkt, PKT_TFTP, FALSE));
+    } else {
+        LOG_PRINTF(LOG_DEBUG, "%s: > TFTP: %s\n\n", time_str(), get_pkt_str(tpkt, PKT_TFTP, FALSE));
     }
 
     if (send_ipv4_packet(handle, (struct ipv4_packet *)pkt->data, pkt->data_len) != 0)
     {
-        printf("Session %3u: Error sending packet via pcap\n", session->session_id);
+        LOG_PRINTF(LOG_ERROR, "Session %3u: %sError sending packet via pcap%s\n", session->session_id, CLR_RED, CLR_RESET);
 
 #ifdef DEBUG
         print_ipv4(&((struct ipv4_packet *)pkt->data)->ip);
@@ -327,7 +375,7 @@ static void tftp_send_error(pcap_t *handle, struct tftp_session *session)
 
     rc = sprintf((char *)(tpkt->tftp.error.error_string), "%s", session->error_text);
     if (rc < 0) {
-        printf("    Error formatting .\n");
+        LOG_PRINTF(LOG_ERROR, "    Error formatting error_text into error packet.\n");
         // close_session(session);
     } else {
         pkt_len += rc + 1;
@@ -343,6 +391,68 @@ static void tftp_send_error(pcap_t *handle, struct tftp_session *session)
 
     send_ipv4_packet(handle, (struct ipv4_packet *)tpkt, pkt_len);
     // close_session(session); // lets retry sending error then close
+}
+
+int tftp_get_free_port(struct tftp_session *session, cli_config_t *config)
+{
+    WSADATA wsaData;
+    SOCKET sock;
+    struct sockaddr_in addr;
+    int exclusive = 1;
+    int total_ports = 0;
+    int start_offset = 0;
+    int i = 0;
+
+    /* Ensure Winsock is initialized (call once at program start) */
+    static int wsa_initialized = 0;
+    if (!wsa_initialized)
+    {
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+        {
+            LOG_PRINTF(LOG_ERROR, "WSAStartup\n");
+            return -1;
+        }
+        wsa_initialized = 1;
+        srand((unsigned int)time(NULL));
+    }
+
+    if (config == NULL || session == NULL) return -1;
+
+    session->dummy_sock = INVALID_SOCKET;
+    session->server_port = (uint16_t)-1;
+
+    total_ports = (int)config->listen_port_end - (int)config->listen_port_start;
+    if (total_ports <= 0) {
+        LOG_PRINTF(LOG_ERROR, "total_ports <= 0 (end:%u, start:%u, total:%d)\n", config->listen_port_end, config->listen_port_start, total_ports);
+        return -1;
+    }
+
+    start_offset = rand() % total_ports;
+
+    for (i = 0; i < total_ports; i++)
+    {
+        u_short candidate_port = config->listen_port_start + ((start_offset + i) % total_ports);
+
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET) continue;
+
+        setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&exclusive, sizeof(exclusive));
+
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = config->interface_ip ? config->interface_ip : INADDR_ANY;
+        addr.sin_port = htons((unsigned short)candidate_port);
+
+        if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+        {
+            session->dummy_sock = sock;
+            session->server_port = htons(candidate_port);
+            return 0;
+        }
+
+        closesocket(sock);
+    }
+    LOG_PRINTF(LOG_ERROR, "Error: tftp_get_free_port\n");
+    return -1;
 }
 
 void session_check(pcap_t *handle)
@@ -369,12 +479,12 @@ void session_check(pcap_t *handle)
             {
                 if (!printed)
                 {
-                    printf("\nRunning sessions:\n");
+                    LOG_PRINTF(LOG_INFO, "\nRunning sessions:\n");
                     printed = TRUE;
                     last_print_time = now;
                 }
 
-                printf(" [%3.0f%%] %3u. %s:%u File: %s\n",
+                LOG_PRINTF(LOG_INFO, " [%3.0f%%] %3u. %s:%u File: %s\n",
                     (double)((s->ack_received + 1)*100)/((double)(s->file_size/s->block_size + 1)),
                     s->session_id,
                     inet_ntoa(*(struct in_addr *)&s->client_ip),
@@ -387,7 +497,7 @@ void session_check(pcap_t *handle)
             {
                 if (s->retries < MAX_RETRIES)
                 {
-                    debug("  Session %3u: Retry block %lld (retry %u/%u)\n", s->session_id, s->block_number, s->retries, MAX_RETRIES);
+                    LOG_PRINTF(LOG_INFO, "%s: * TFTP[s%u]: Retrying sending block %lld (attempt %u/%u)\n", time_str(), s->session_id, s->block_number, s->retries, MAX_RETRIES);
                     if (s->in_use == TFTP_SENDING) {
                         tftp_send_packets(handle, s);
                     } else if (s->in_use == TFTP_RECEIVING) {
@@ -400,14 +510,14 @@ void session_check(pcap_t *handle)
                 } 
                 else 
                 {
-                    printf("  Session %3u closed after %d retries\n", s->session_id, s->retries);
+                    LOG_PRINTF(LOG_INFO, "%s: * TFTP[s%u]: Max Retry (%u) Reached\n", time_str(), s->session_id, s->retries);
                     close_session(s);
                 }
             }
         }
     }
     
-    if (printed) printf("\n");
+    if (printed) LOG_PRINTF(LOG_INFO, "\n");
 }
 
 void close_session(struct tftp_session *session)
@@ -424,25 +534,26 @@ void close_session(struct tftp_session *session)
     
     if (session->error_occurred)
     {
-        printf(" Session %3u: Error[%u] %s\n", session->session_id, session->error_occurred & ~TFTP_ERROR_FLAG, session->error_text);
+        LOG_PRINTF(LOG_ERROR, "%s: * TFTP[s%u]: Error[%u] %s\n", time_str(), session->session_id, session->error_occurred & ~TFTP_ERROR_FLAG, session->error_text);
     }
     else if (session->last_packet)
     {
-        printf("Session %3u: Complete (%5.3f MB/s)\n", session->session_id, transferred_mb / duration_s);
+        LOG_PRINTF(LOG_INFO, "%s: * TFTP[s%u]: Complete (%5.3f MB/s)\n", time_str(), session->session_id, transferred_mb / duration_s);
     }
     else
     {
-        printf("Session %3u: Terminated\n", session->session_id);
+        LOG_PRINTF(LOG_ERROR, "%s: * TFTP[s%u]: Terminated\n", time_str(), session->session_id);
     }
 
-    printf("             Processing time %.4f us/packet\n",
+    LOG_PRINTF(LOG_VERBOSE, "                Processing time %.4f us/packet\n",
         ((double)session->processing_time / processing_timer.frequency.QuadPart) * 1000000.0 / session->sent_packet_count
     );
-    debug("             Sent %llu packets\n", session->sent_packet_count);
+    LOG_PRINTF(LOG_VERBOSE, "                Sent %llu packets\n", session->sent_packet_count);
 
     if (session->fd) {
         fclose(session->fd);
         if (session->in_use == TFTP_RECEIVING && session->last_packet == FALSE) {
+            LOG_PRINTF(LOG_VERBOSE, "%s: * TFTP[s%u]: Incomplete Transfer, file removed\n", time_str(), session->session_id);
             if (remove(session->file_name) != 0) perror("remove");
         }
         session->fd = NULL;
@@ -458,6 +569,9 @@ void close_session(struct tftp_session *session)
         queue_free(session->pkts);
         session->pkts = NULL;
     }
+
+    if (session->dummy_sock != INVALID_SOCKET)
+        closesocket(session->dummy_sock);
 
     session->in_use = TFTP_NOT_USING;
     memset(session, 0, sizeof(*session));
@@ -490,7 +604,7 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
         if (session->in_use
             && session->client_ip == pkt->ip.src_addr
             && session->client_port == pkt->udp.source
-            && session->server_port == pkt->udp.dest
+            && (session->server_port == pkt->udp.dest || ntohs(pkt->udp.dest) == REQUEST_PORT)
             && COMPARE_MAC(session->client_mac, pkt->eth.src_mac)
         )
         {
@@ -499,27 +613,35 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
                 if (ntohs(pkt->udp.dest) != REQUEST_PORT || ntohs(pkt->tftp.opcode) != OPCODE_RRQ || ntohs(pkt->tftp.opcode) != OPCODE_WRQ)
                 {
                     if (
-#ifdef DEBUG 
-                       1 || 
-#endif 
                         ntohs(pkt->tftp.opcode) == OPCODE_ERROR || 
                         ntohs(pkt->tftp.opcode) == OPCODE_OACK  || 
                         (ntohs(pkt->tftp.opcode) == OPCODE_ACK && ntohs(pkt->tftp.ack.block_number) <= 1) || 
                         (ntohs(pkt->tftp.opcode) == OPCODE_DATA && ntohs(pkt->tftp.data.block_number) <= 1)
                     ){
-                        printf("%s: < TFTP: %s\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+                        LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
+                    } else {
+                        LOG_PRINTF(LOG_VERBOSE, "%s: < TFTP: %s\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
                     }
                     return session;
                 }
                 else
                 {
-                    printf("%s: < TFTP: %s duplicate\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+                    LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s duplicate\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
                     return NULL;
                 }
             }
             else
             {
-                debug("%s: < TFTP: %s duplicate vlan\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+                if (
+                    ntohs(pkt->tftp.opcode) == OPCODE_ERROR || 
+                    ntohs(pkt->tftp.opcode) == OPCODE_OACK  || 
+                    (ntohs(pkt->tftp.opcode) == OPCODE_ACK && ntohs(pkt->tftp.ack.block_number) <= 1) || 
+                    (ntohs(pkt->tftp.opcode) == OPCODE_DATA && ntohs(pkt->tftp.data.block_number) <= 1)
+                ){
+                    LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s duplicate vlan\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
+                } else {
+                    LOG_PRINTF(LOG_VERBOSE, "%s: < TFTP: %s duplicate vlan\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
+                }
                 return NULL;
             }
         }
@@ -527,13 +649,13 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
 
     if (ntohs(pkt->tftp.opcode) != OPCODE_RRQ && ntohs(pkt->tftp.opcode) != OPCODE_WRQ)
     {
-        printf("%s: < TFTP: %s ses not found\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+        LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s ses not found\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
         return NULL;
     }
 
-    if (ntohs(pkt->udp.dest) != REQUEST_PORT)
+    if (ntohs(pkt->udp.dest) != config.ip_port)
     {
-        printf("%s: < TFTP: %s not req port\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+        LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s not req port\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
         return NULL;
     }
 
@@ -546,24 +668,28 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
     }
 
     if (session == NULL || session->in_use) {
-        printf("%s: < TFTP: %s maximum session reached\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+        LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s maximum session reached\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
         return NULL;
     }
 
-    printf("%s: < TFTP: %s\n", time_str(), get_tftp_pkt_desc(pkt, TRUE));
+    LOG_PRINTF(LOG_INFO, "%s: < TFTP: %s\n", time_str(), get_pkt_str(pkt, PKT_TFTP, TRUE));
 
     memset(session, 0, sizeof(*session));
-
-    session->pkts = queue_init();
-    if (!session->pkts)
-        tftp_set_error(session, TFTP_ERROR_UNKNOWN, "Failed to initialize packet queue");
 
     session->created_at = GetTickCount();
     if (ntohs(pkt->tftp.opcode) == OPCODE_RRQ) session->in_use = TFTP_SENDING;
     else if (ntohs(pkt->tftp.opcode) == OPCODE_WRQ) session->in_use = TFTP_RECEIVING;
     else return NULL;
+    
+    session->pkts = queue_init();
+    if (!session->pkts)
+        tftp_set_error(session, TFTP_ERROR_UNKNOWN, "Failed to initialize packet queue");
+
     session->session_id = ++session_counter;
-    session->server_port = htons(START_PORT + i);
+    // session->server_port = htons(START_PORT + i);
+    if (tftp_get_free_port(session, &config) != 0)
+        tftp_set_error(session, TFTP_ERROR_UNKNOWN, "No udp ports free");
+
 
     memcpy(session->client_mac, pkt->eth.src_mac, 6);
     session->client_ip = pkt->ip.src_addr;
@@ -575,7 +701,7 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
 
     if (session->in_use == TFTP_SENDING)
     {
-        if (tftp_is_ftp_url(session->file_name))
+        if (tftp_is_ftp_url(session))
         {
             session->ftp = ftp_request_file(session->file_name);
             if (session->ftp == NULL)
@@ -649,7 +775,7 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
     session->packet_header.ip.ttl = 128;
     session->packet_header.ip.protocol = IPV4_PROTOCOL_UDP;
     session->packet_header.ip.checksum = 0;
-    session->packet_header.ip.src_addr = htonl(MY_IP);
+    session->packet_header.ip.src_addr = config.ip_address;
     session->packet_header.ip.dest_addr = session->client_ip;
 
     // Ethernet Headers
@@ -658,13 +784,13 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
         struct eth_mover *mover = (struct eth_mover *)&session->packet_header;
         mover->padding = (uint32_t)-1; // For optimization in send_via_pcap()
         memcpy(mover->eth.dest_mac, session->client_mac, 6);
-        memcpy(mover->eth.src_mac, MY_MAC, 6);
+        memcpy(mover->eth.src_mac, config.MY_MAC, 6);
         mover->eth.ethertype = htons(ETHERTYPE_IPV4);
     }
     else
     {
         memcpy(session->packet_header.eth.dest_mac, session->client_mac, 6);
-        memcpy(session->packet_header.eth.src_mac, MY_MAC, 6);
+        memcpy(session->packet_header.eth.src_mac, config.MY_MAC, 6);
         session->packet_header.eth.vlan_tpid = htons(ETHERTYPE_VLAN);
         session->packet_header.eth.vlan_tci = session->vlan_id;
         session->packet_header.eth.ethertype = htons(ETHERTYPE_IPV4);
@@ -674,42 +800,42 @@ struct tftp_session *get_session(const struct tftp_packet *pkt, uint32_t pkt_len
     tftp_prepare_packets(session);
 
     // Print relevant information
-    printf("\n%s\nSession ID: %3u", time_str(), session->session_id);
+    LOG_PRINTF(LOG_INFO, "\n%s\nSession ID: %3u", time_str(), session->session_id);
     if (session->in_use == TFTP_RECEIVING)
-        printf(" [WRQ]%s\n", (session->ftp) ? "[FTP]" : "");
+        LOG_PRINTF(LOG_INFO, " [WRQ]%s\n", (session->ftp) ? "[FTP]" : "");
     else if (session->in_use == TFTP_SENDING)
-        printf(" [RRQ]%s\n", (session->ftp) ? "[FTP]" : "");
-    printf("  %s:%u [VLAN:%d]\n", inet_ntoa(*(struct in_addr *)&session->client_ip), ntohs(session->client_port), (short)ntohs(session->vlan_id));
-    // printf("  Session Server Port: %u\n", ntohs(session->server_port));
-    // printf("  Session Client MAC:");
+        LOG_PRINTF(LOG_INFO, " [RRQ]%s\n", (session->ftp) ? "[FTP]" : "");
+    LOG_PRINTF(LOG_INFO, "  %s:%u [VLAN:%d]\n", inet_ntoa(*(struct in_addr *)&session->client_ip), ntohs(session->client_port), (short)ntohs(session->vlan_id));
+    LOG_PRINTF(LOG_INFO, "  Session Server Port: %u\n", ntohs(session->server_port));
+    // LOG_PRINTF(LOG_INFO, "  Session Client MAC:");
     // print_mac(session->client_mac);
 
-    printf("  File  : %s\n", session->file_name);
+    LOG_PRINTF(LOG_INFO, "  File  : %s\n", session->file_name);
 
     file_size = (session->in_use == TFTP_SENDING) ? session->file_size : session->tsize;
     if ((session->fd != NULL || session->ftp != NULL) && file_size){
-        printf("  Size  : %0.4f %s\n",
+        LOG_PRINTF(LOG_INFO, "  Size  : %0.4f %s\n",
             (file_size > 1024*1024 ? (float)file_size/(1024*1024) : (file_size > 1024 ? (float)file_size/1024 : (float)file_size)),
             (file_size > 1024*1024 ? "MB" : (file_size > 1024 ? "KB" : "Bytes")));
     }
-    // printf("  Block Needed: %ld\n", (file_size / session->block_size) + 1);
+    // LOG_PRINTF(LOG_INFO, "  Block Needed: %ld\n", (file_size / session->block_size) + 1);
 
     if (session->options_requested != 0)
     {
-        printf("  Option:");
+        LOG_PRINTF(LOG_INFO, "  Option:");
         if (session->options_requested & OPTIONS_TSIZE_REQUESTED)
-            printf(" tsize[%ld]", session->tsize);
+            LOG_PRINTF(LOG_INFO, " tsize[%ld]", session->tsize);
         if (session->options_requested & OPTIONS_BLKSIZE_REQUESTED)
-            printf(" blksize[%d]", session->block_size);
+            LOG_PRINTF(LOG_INFO, " blksize[%d]", session->block_size);
         if (session->options_requested & OPTIONS_TIMEOUT_REQUESTED)
-            printf(" timeout[%d]", session->timeout / 1000);
+            LOG_PRINTF(LOG_INFO, " timeout[%d]", session->timeout / 1000);
         if (session->options_requested & OPTIONS_WINDOWSIZE_REQUESTED)
-            printf(" windowsize[%d]", session->windowsize);
-        printf("\n");
+            LOG_PRINTF(LOG_INFO, " windowsize[%d]", session->windowsize);
+        LOG_PRINTF(LOG_INFO, "\n");
     }
 
     if (session->error_occurred)
-        printf(" ERROR: [%u] %s\n", session->error_occurred & ~TFTP_ERROR_FLAG, session->error_text);
+        LOG_PRINTF(LOG_ERROR, " ERROR: [%u] %s\n", session->error_occurred & ~TFTP_ERROR_FLAG, session->error_text);
 
     return session;
 }
@@ -721,7 +847,7 @@ int tftp_update_session(struct tftp_session *session, uint32_t ack_block)
     if (ack_block <= session->ack_received)
     {
         debug("    Duplicate ACK for block %u, ignoring.\n", ack_block);
-        return FALSE;
+        return TRUE;
     }
     else if (ack_block > session->block_number + 1)
     {
@@ -1038,12 +1164,7 @@ void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len
     struct tftp_session *session = NULL;
 
     session = get_session(pkt, pkt_len);
-    if (session == NULL)
-    {
-        // printf("%s: < TFTP: session creation failed\n", time_str());
-        // debug("Unable to create/find session\n");
-        return;
-    }
+    if (session == NULL) return;
 
     switch (ntohs(pkt->tftp.opcode))
     {
@@ -1075,13 +1196,13 @@ void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len
         break;
 
     case OPCODE_ERROR:
-        printf("\nTFTP ERROR received: Code %u\n", ntohs(pkt->tftp.error.error_code));
-        printf("  Error Message: %s\n", pkt->tftp.error.error_string);
+        LOG_PRINTF(LOG_ERROR, "\nTFTP ERROR received: Code %u\n", ntohs(pkt->tftp.error.error_code));
+        LOG_PRINTF(LOG_ERROR, "  Error Message: %s\n", pkt->tftp.error.error_string);
         close_session(session);
         break;
 
     default:
-        printf("\nTFTP Unknown opcode in existing session\n");
+        LOG_PRINTF(LOG_ERROR, "\nTFTP Unknown opcode in existing session\n");
         break;
     }
 

@@ -7,6 +7,7 @@
 #include "packet.h"
 #include "queue.h"
 #include "ftp_handler.h"
+#include "cli_config.h"
 
 struct tftp_session
 {
@@ -18,6 +19,7 @@ struct tftp_session
     uint32_t session_id;  // Unique session identifier for debugging
 
     // Client and Server info
+    SOCKET dummy_sock; // Dummy socket to get port from OS
     uint16_t server_port;
     uint8_t client_mac[6];
     uint32_t client_ip;
@@ -74,6 +76,7 @@ struct tftp_session
 
 extern uint16_t ipv4_id;
 
+int tftp_get_free_port(struct tftp_session *session, cli_config_t *config);
 void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len);
 void session_check(pcap_t *handle);
 void clean_all_sessions();
