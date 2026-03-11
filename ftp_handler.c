@@ -1,4 +1,6 @@
 #include "ftp_handler.h"
+#include "fast_log.h"
+
 #include "packet.h"
 #include <stdio.h>
 #include <string.h>
@@ -96,7 +98,7 @@ CURLcode ftp_get_metadata(const char *ftp_url, ftp_metadata_t *out_meta)
     res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         curl_easy_cleanup(curl);
-        printf("%s: * FTP: libcurl metadata error: %s\n", time_str(),  curl_easy_strerror(res));
+        LOG_PRINTF(LOG_ERROR, "%s: * FTP: libcurl metadata error: %s\n", time_str(),  curl_easy_strerror(res));
         debug("%s: * FTP: details: %s\n", time_str(), errbuf);
         return res;
     }
@@ -120,9 +122,18 @@ ftp_download_t* ftp_request_file(const char *url)
     if (!multi || !url)
         return NULL;
 
+    /* Check if this URL is already requested */
+    for (i = 0; i < MAX_FTP_DOWNLOADS; i++) {
+        if (downloads[i].in_use != 0 && downloads[i].has_error == FALSE && strcmp(downloads[i].url, url) == 0) {
+            downloads[i].in_use++;
+            LOG_PRINTF(LOG_INFO, "%s: * FTP: reuse %s (refs=%d)\n", time_str(), url, downloads[i].in_use);
+            return &downloads[i];
+        }
+    }
+
     /* Find a free slot */
     for (i = 0; i < MAX_FTP_DOWNLOADS; i++) {
-        if (!downloads[i].in_use) {
+        if (downloads[i].in_use == 0) {
             slot = i;
             break;
         }
@@ -135,9 +146,9 @@ ftp_download_t* ftp_request_file(const char *url)
 
     /* Initialize download structure */
     downloads[slot].size = 0;
-    downloads[slot].in_use = 1;
-    downloads[slot].completed = 0;
-    downloads[slot].has_error = 0;
+    downloads[slot].in_use = 1; // First use
+    downloads[slot].completed = FALSE;
+    downloads[slot].has_error = FALSE;
     downloads[slot].error_msg[0] = '\0';
     strncpy(downloads[slot].url, url, sizeof(downloads[slot].url) - 1);
     downloads[slot].url[sizeof(downloads[slot].url) - 1] = '\0';
@@ -207,7 +218,7 @@ ftp_download_t* ftp_request_file(const char *url)
     int running;
     curl_multi_perform(multi, &running);
 
-    printf("%s: * FTP: started %s (%zu bytes)\n", time_str(), url, downloads[slot].capacity);
+    LOG_PRINTF(LOG_INFO, "%s: * FTP: started %s (%zu bytes)\n", time_str(), url, downloads[slot].capacity);
 
     return &downloads[slot];
 }
@@ -230,7 +241,7 @@ int ftp_get_event_handles(HANDLE *handles, int max_handles)
     /* Get file descriptors from curl */
     mc = curl_multi_fdset(multi, &read_fd, &write_fd, &except_fd, &maxfd);
     if (mc != CURLM_OK) {
-        fprintf(stderr, "curl_multi_fdset failed: %s\n", curl_multi_strerror(mc));
+        LOG_PRINTF(LOG_ERROR, "curl_multi_fdset failed: %s\n", curl_multi_strerror(mc));
         return 0;
     }
 
@@ -254,14 +265,14 @@ int ftp_get_event_handles(HANDLE *handles, int max_handles)
             if (!socket_events[count]) {
                 socket_events[count] = WSACreateEvent();
                 if (!socket_events[count]) {
-                    fprintf(stderr, "WSACreateEvent failed\n");
+                    LOG_PRINTF(LOG_ERROR, "WSACreateEvent failed\n");
                     continue;
                 }
             }
 
             /* Associate event with socket */
             if (WSAEventSelect((SOCKET)i, socket_events[count], events) == SOCKET_ERROR) {
-                fprintf(stderr, "WSAEventSelect failed: %d\n", WSAGetLastError());
+                LOG_PRINTF(LOG_ERROR, "WSAEventSelect failed: %d\n", WSAGetLastError());
                 continue;
             }
 
@@ -312,7 +323,7 @@ int ftp_download_poll(void)
     do {
         mc = curl_multi_perform(multi, &running_handles);
         if (mc != CURLM_OK) {
-            fprintf(stderr, "curl_multi_perform failed: %s\n", curl_multi_strerror(mc));
+            LOG_PRINTF(LOG_ERROR, "curl_multi_perform failed: %s\n", curl_multi_strerror(mc));
             break;
         }
     } while (mc == CURLM_CALL_MULTI_PERFORM);
@@ -328,11 +339,11 @@ int ftp_download_poll(void)
             if (dl) {
                 if (msg->data.result == CURLE_OK) {
                     dl->completed = 1;
-                    printf("%s: * FTP: completed %s (%zu/%zu bytes)\n", time_str(), dl->url, dl->size, dl->capacity);
+                    LOG_PRINTF(LOG_INFO, "%s: * FTP: completed %s (%zu/%zu bytes)\n", time_str(), dl->url, dl->size, dl->capacity);
                 } else {
                     dl->has_error = 1;
                     snprintf(dl->error_msg, sizeof(dl->error_msg), "FTP: Download failed: %s", curl_easy_strerror(msg->data.result));
-                    fprintf(stderr, "FTP download error: %s - %s\n", dl->url, dl->error_msg);
+                    LOG_PRINTF(LOG_ERROR, "%s: * FTP: download error: %s - %s\n", time_str(), dl->url, dl->error_msg);
                 }
             }
 
@@ -352,6 +363,14 @@ void ftp_download_free(ftp_download_t *download)
     if (!download)
         return;
 
+    download->in_use--;
+
+    LOG_PRINTF(LOG_INFO, "%s: * FTP: release %s (remaining refs=%d)\n", time_str(), download->url, download->in_use);
+
+    if (download->in_use > 0) {
+        return;
+    }
+
     /* Remove from multi handle if still active */
     if (download->easy_handle) {
         curl_multi_remove_handle(multi, download->easy_handle);
@@ -369,8 +388,8 @@ void ftp_download_free(ftp_download_t *download)
     download->in_use = 0;
     download->size = 0;
     download->capacity = 0;
-    download->completed = 0;
-    download->has_error = 0;
+    download->completed = FALSE;
+    download->has_error = FALSE;
     download->error_msg[0] = '\0';
     download->url[0] = '\0';
 }
@@ -383,6 +402,7 @@ void ftp_handler_cleanup(void)
         /* Clean up all active downloads */
         for (i = 0; i < MAX_FTP_DOWNLOADS; i++) {
             if (downloads[i].in_use) {
+                downloads[i].in_use = 0; // Force free
                 ftp_download_free(&downloads[i]);
             }
             if (socket_events[i]) {

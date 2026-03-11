@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <pcap.h>
 
+#include "fast_log.h"
+
 #define MAX_BLOCK_SIZE 65535 // Maximum UDP block size
 #define MIN_BLOCK_SIZE 8     // Minimum UDP block size
 #define DEFAULT_BLOCK_SIZE 512 // Default UDP block size
@@ -214,12 +216,17 @@ struct tftp_packet
 };
 #pragma pack(0)
 
-extern uint8_t MY_MAC[6];
-extern uint32_t MY_IP;
+typedef enum {
+    PKT_ARP,
+    PKT_IPV4,
+    PKT_ICMP,
+    PKT_UDP,
+    PKT_TFTP
+} packet_type;
 
 #ifdef DEBUG
 #include <stdio.h>
-#define debug(...) printf(__VA_ARGS__)
+#define debug(...) LOG_PRINTF(LOG_DEBUG, __VA_ARGS__)
 #else
 #define debug(...) ((void)0)
 #endif
@@ -247,7 +254,8 @@ void timer_start(timer_t* timer);
 uint64_t timer_elapsed_us(timer_t* timer);
 void timer_init(timer_t* timer);
 
-char *get_tftp_pkt_desc(const struct tftp_packet *tftp, int use_src);
+char *get_pkt_str(const void *pkt, packet_type type, int use_src);
+
 char *time_str();
 void print_mac(const uint8_t *mac);
 void print_ipv4(const struct ipv4_header *hdr);

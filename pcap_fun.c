@@ -2,199 +2,212 @@
 #include <locale.h>
 
 #include "pcap_fun.h"
+#include "cli_config.h"
+#include "fast_log.h"
 
-
-int get_ip_mac_name(const char *interface_name, ip_mac_name_t *info)
+devices_t *get_devices()
 {
+    devices_t *head = NULL;
+    devices_t *curr = NULL;
+    size_t str_len = 0;
+
+    pcap_if_t *alldevs = NULL;
+    pcap_if_t *dev = NULL;
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+
     ULONG bufferSize = 0;
-    DWORD result;
-    int found = FALSE;
+    DWORD result = 0;
     PIP_ADAPTER_ADDRESSES pAddresses = NULL;
+    PIP_ADAPTER_ADDRESSES pCurrent = NULL;
+    PIP_ADAPTER_UNICAST_ADDRESS pUnicast = NULL;
 
-    if (!info){
-        return FALSE;
-    }
-
-    // First call to get buffer size
+    // First call to get bufferSize
     result = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, NULL, &bufferSize);
-    if (result == ERROR_BUFFER_OVERFLOW)
-    {
+    if (result == ERROR_BUFFER_OVERFLOW) {
         pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(bufferSize);
-        if (!pAddresses)
-        {
-            debug("Memory allocation failed.\n");
-            return UNKNOWN_ERROR;
-        }
+        if (!pAddresses) goto err;
         // Retrieve adapter information
         result = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, pAddresses, &bufferSize);
     }
 
-    if (result != ERROR_SUCCESS)
-    {
-        debug("Error: %lu\n", result);
-        free(pAddresses);
-        return UNKNOWN_ERROR;
-    }
+    if (result != ERROR_SUCCESS) goto err;
 
-    // Iterate through adapters
-    PIP_ADAPTER_ADDRESSES pCurrent = pAddresses;
-    while (pCurrent)
-    {
-        if (pCurrent->PhysicalAddressLength == 6 && strcmp(pCurrent->AdapterName, interface_name + 12) == 0)
-        {
-            // wprintf(L"Name: %ls, ", pCurrent->FriendlyName);
-            wcsncpy(info->name, pCurrent->FriendlyName, sizeof(info->name) / sizeof(info->name[0]));
-            info->name[sizeof(info->name) / sizeof(info->name[0]) - 1] = L'\0';
+    if (pcap_findalldevs(&alldevs, errbuf) == -1) goto err;
+    for (dev = alldevs; dev; dev = dev->next){
+        curr = (devices_t *)malloc(sizeof(devices_t));
+        if (curr == NULL) break;
+        memset(curr, 0, sizeof(devices_t));
 
-            memcpy(info->mac, pCurrent->PhysicalAddress, sizeof(info->mac));
-
-            PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurrent->FirstUnicastAddress;
-            for (; pUnicast != NULL; pUnicast = pUnicast->Next)
-            {
-                if (pUnicast->Address.lpSockaddr->sa_family == AF_INET)
-                {
+        pCurrent = pAddresses;
+        for (; pCurrent != NULL; pCurrent = pCurrent->Next) {
+            if (pCurrent->OperStatus != IfOperStatusUp) continue;
+            if (pCurrent->PhysicalAddressLength == 6 && strcmp(pCurrent->AdapterName, dev->name + 12) == 0) {
+                pUnicast = pCurrent->FirstUnicastAddress;
+                for (; pUnicast != NULL; pUnicast = pUnicast->Next){
+                    if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) break;
+                }
+                if (pUnicast) {
+                    curr->ip = ((struct sockaddr_in *)pUnicast->Address.lpSockaddr)->sin_addr.s_addr;
+                    curr->mask = (pUnicast->OnLinkPrefixLength == 0) ? 0 : htonl(~0u << (32 - pUnicast->OnLinkPrefixLength));
+                    curr->mtu = pCurrent->Mtu;
+                    // wcsncpy(curr->name, pCurrent->FriendlyName, sizeof(curr->name) / sizeof(curr->name[0]));
+                    // curr->name[sizeof(curr->name) / sizeof(curr->name[0]) - 1] = L'\0';
+                    if (pCurrent->FriendlyName) {
+                        str_len = WideCharToMultiByte(CP_UTF8, 0, pCurrent->FriendlyName, -1, NULL, 0, NULL, NULL);
+                        
+                        if (str_len > 0) {
+                            curr->name = (char *)malloc(str_len);
+                            if (curr->name) WideCharToMultiByte(CP_UTF8, 0, pCurrent->FriendlyName, -1, curr->name, str_len, NULL, NULL);
+                        }
+                        // str_len = wcslen(pCurrent->FriendlyName) + 1;
+                        // curr->name = (wchar_t *)malloc(str_len * sizeof(wchar_t));
+                        // if (curr->name) wcsncpy(curr->name, pCurrent->FriendlyName, str_len);
+                    }
+                    memcpy(curr->mac, pCurrent->PhysicalAddress, sizeof(curr->mac));
+                    // strncpy(curr->dev_name, dev->name, sizeof(curr->dev_name));
+                    // curr->dev_name[sizeof(curr->dev_name) - 1] = '\0';
+                    if (dev->name) {
+                        str_len = strlen(dev->name) + 1;
+                        curr->dev_name = (char *)malloc(str_len);
+                        if (curr->dev_name) strncpy(curr->dev_name, dev->name, str_len);
+                    }
+                    // strncpy(curr->dev_desc, dev->description, sizeof(curr->dev_desc));
+                    // curr->dev_desc[sizeof(curr->dev_desc) - 1] = '\0';
+                    if (dev->description) {
+                        str_len = strlen(dev->description) + 1;
+                        curr->dev_desc = (char *)malloc(str_len);
+                        if (curr->dev_desc) strncpy(curr->dev_desc, dev->description, str_len);
+                    }
                     break;
                 }
             }
-            info->ip = ((struct sockaddr_in *)pUnicast->Address.lpSockaddr)->sin_addr.s_addr;
-            found = TRUE;
-            break;
         }
-        pCurrent = pCurrent->Next;
+
+        if (curr->ip && curr->dev_name && curr->name){
+            curr->next = head;
+            head = curr;
+        } else {
+            free(curr->dev_desc);
+            free(curr->dev_name);
+            free(curr->name);
+            free(curr);
+            curr = NULL;
+        }
     }
 
-    free(pAddresses);
-
-    return found;
+err:
+    if (alldevs) pcap_freealldevs(alldevs);
+    if (pAddresses) free(pAddresses);
+    return head;
 }
 
-pcap_t *initialize_pcap()
+devices_t *select_device(devices_t *devs, cli_config_t *config)
 {
-    pcap_if_t *alldevs, *dev;
-    pcap_t *handle;
-    char errbuf[PCAP_ERRBUF_SIZE];
-    struct bpf_program filter;
+    devices_t *selected = NULL;
+
+    if (devs == NULL || config == NULL) return NULL;
+
+    if (config->interface_identifier[0] != '\0')
+    {
+        for (selected = devs; selected != NULL; selected = selected->next)
+        {
+            if (
+                strcmp(selected->name, config->interface_identifier) == 0 ||
+                strcmp(selected->dev_name, config->interface_identifier) == 0)
+            {
+                if (config->ip_address == 0)
+                    config->ip_address = selected->ip;
+                config->is_spoofing = (selected->ip != config->ip_address);
+                config->interface_ip = selected->ip;
+                return selected;
+            }
+        }
+    }
+    else if (config->ip_address != 0)
+    {
+        for (selected = devs; selected != NULL; selected = selected->next)
+        {
+            if ((selected->ip & selected->mask) == (config->ip_address & selected->mask))
+            {
+                strncpy(config->interface_identifier, selected->name, sizeof(config->interface_identifier));
+                config->interface_identifier[sizeof(config->interface_identifier) - 1] = '\0';
+                config->is_spoofing = (selected->ip != config->ip_address);
+                config->interface_ip = selected->ip;
+                return selected;
+            }
+        }
+    }
+    return NULL;
+}
+
+devices_t *choose_device(devices_t *devs, cli_config_t *config)
+{
+    devices_t *selected = NULL;
+    size_t i = 0, len = 0;
+    
+    if (devs == NULL || config == NULL) return NULL;
+    
+    LOG_PRINTF(LOG_NONE, "Select an interface:\n");
+    for (selected = devs, i = 1, len = 0; selected != NULL; selected = selected->next, i++, len++)
+    {
+        LOG_PRINTF(LOG_NONE, "%2lld:", i);
+        LOG_PRINTF(LOG_NONE, " %16s/%u", inet_ntoa(*(struct in_addr *)&selected->ip), __builtin_popcount(selected->mask));
+        LOG_PRINTF(LOG_NONE, ", %-25s", selected->name);
+        LOG_PRINTF(LOG_VERBOSE, "\t %-50s", selected->dev_name);
+        LOG_PRINTF(LOG_VERBOSE, ",\t %s", selected->dev_desc ? selected->dev_desc : "(No description available)");
+        LOG_PRINTF(LOG_NONE, "\n");
+    }
+
+    LOG_PRINTF(LOG_NONE, "Enter interface (number): ");
+    log_flush();
+    if (scanf("%lld", &i) == 0 || (i < 1) || (i > len))
+    {
+        LOG_PRINTF(LOG_NONE, "Invalid choice\n");
+        return NULL;
+    }
+
+    selected = devs;
+    while (--i > 0) selected = selected->next;
+
+    if (selected) {
+        strncpy(config->interface_identifier, selected->name, sizeof(config->interface_identifier));
+        config->interface_identifier[sizeof(config->interface_identifier) - 1] = '\0';
+        if (config->ip_address == 0) config->ip_address = selected->ip;
+        config->is_spoofing = (selected->ip != config->ip_address);
+        config->interface_ip = selected->ip;
+        return selected;
+    }
+
+    return NULL;
+}
+
+void free_devs(devices_t *h){
+    devices_t *next = NULL;
+    while (h != NULL){
+        next = h->next;
+        free(h->dev_desc);
+        free(h->dev_name);
+        free(h->name);
+        free(h);
+        h = next;
+    }
+}
+
+pcap_t *get_pcap_handle(devices_t *dev, cli_config_t *config){
+    pcap_t *handle = NULL;
+    char errbuf[PCAP_ERRBUF_SIZE] = {0};
+    struct bpf_program filter = {0};
     char filter_exp[1000] = "";
     char filter_exp_part[400] = "";
-    bpf_u_int32 net;
 
-    int rc = 0;
+    if (dev == NULL || config == NULL)  return NULL;
 
-    debug("Finding devices...\n");
+    memcpy(config->MY_MAC, dev->mac, sizeof(config->MY_MAC));
+    config->mtu = dev->mtu;
 
-    ip_mac_name_t infos[99] = {0};
-
-    if (pcap_findalldevs(&alldevs, errbuf) == -1)
-    {
-        printf("Error finding devices: %s\n", errbuf);
-        goto err;
-    }
-
-    int info_len = 0, i = 0;
-    for (dev = alldevs; dev; dev = dev->next)
-    {
-        debug("  Checking %-50s\n", dev->name);
-        if (info_len >= sizeof(infos) / sizeof(infos[0]) - 1)
-        {
-            printf("Too many devices, some are not listed...\n");
-            break;
-        }
-
-        if (get_ip_mac_name(dev->name, &infos[info_len]) != TRUE)
-        {
-            debug("    IP  : Unknown\n");
-            debug("    Name: Unknown\n");
-            debug("    Desc: %s\n\n", dev->description ? dev->description : "(No description available)");
-
-            continue;
-        } 
-        else 
-        {
-#ifdef DEBUG
-            debug("    IP  : %s\n", inet_ntoa(*(struct in_addr *)&infos[info_len].ip));
-            wprintf(L"    Name: %ls\n", infos[info_len].name);
-            debug("    Desc: %s\n\n", dev->description ? dev->description : "(No description available)");
-#endif
-        }
-            
-        if (pcap_lookupnet(dev->name, &infos[info_len].ip_mask, &infos[info_len].mask, errbuf) == -1)
-        {
-            infos[info_len].ip_mask = 0;
-            infos[info_len].mask = 0;
-        }
-
-        infos[info_len].dev = dev;
-
-        info_len++;
-        
-    }
-
-    if (info_len == 0)
-    {
-        printf("No interfaces found.\n");
-        goto err;
-    }
-
-    debug("\n");
-
-    /* Auto-select "Ethernet" if present */
-    for (i = 0, rc = 0; i < info_len; i++)
-    {
-        if (wcscmp(infos[i].name, L"Ethernet") == 0 || info_len == 1)
-        {
-            rc = 1;
-            wprintf(L"Auto-selected %ls, ", infos[i].name);
-            printf("%s\n", inet_ntoa(*(struct in_addr *)&infos[i].ip));
-            i++; // Selection is i+1 for user
-            break;
-        }
-    }
-
-    if (!rc) // Did not auto select, let user choose interface
-    {    
-        printf("Select an interface:\n"); 
-        for (i = 0; i < info_len; i++)
-        {
-            printf("%2d:", i + 1);
-            printf(" %-16s", inet_ntoa(*(struct in_addr *)&infos[i].ip));
-            wprintf(L", %-25ls", infos[i].name);
-            debug("\t %-50s", infos[i].dev->name);
-            debug(",\t %s", infos[i].dev->description ? infos[i].dev->description : "(No description available)");
-            printf("\n");
-        }
-        printf("Enter interface (number): ");
-        rc = scanf("%d", &i);
-    }
-
-    if (!rc || (i < 1) || (info_len < i))
-    {
-        printf("Invalid choice.\n");
-        goto err;
-    }
-    
-    dev = infos[i - 1].dev;
-    memcpy(MY_MAC, infos[i - 1].mac, 6);
-#ifdef SPOOF_NON_VLAN
-    // Move some IP address, so I don't conflict with myself
-    infos[i - 1].ip += ntohl(0x0a);
-#endif
-    MY_IP = ntohl(infos[i - 1].ip);
-    net = infos[i - 1].ip_mask;
-
-    printf("\nSelected interface:\n");
-    printf("  IP    : %s/%d\n", inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), __builtin_popcount(infos[i - 1].mask));
-    debug("  Mask  : %s\n", inet_ntoa(*(struct in_addr *)&infos[i - 1].mask));
-    wprintf(L"  Name  : %ls\n", infos[i - 1].name);
-    printf("  Desc. : %s\n", infos[i - 1].dev->description ? infos[i - 1].dev->description : "");
-    debug("  GUID  : %s\n", infos[i - 1].dev->name);
-    // printf("  Network   : %s\n", inet_ntoa(*(struct in_addr *)&infos[i - 1].ip_mask));
-
-
-    wprintf(L"\nInitializing %ls [%s]... ", infos[i - 1].name, dev->name);
-    handle = pcap_create(dev->name, errbuf);
-    if (!handle)
-    {
-        fprintf(stderr, "Error creating pcap handle: %s\n", errbuf);
+    handle = pcap_create(dev->dev_name, errbuf);
+    if (!handle) {
+        LOG_PRINTF(LOG_ERROR, "Error creating pcap handle: %s\n", errbuf);
         goto err;
     }
 
@@ -203,43 +216,34 @@ pcap_t *initialize_pcap()
         pcap_set_timeout(handle, 1) != 0 ||
         pcap_set_immediate_mode(handle, 1) != 0)
     {
-        fprintf(stderr, "Error setting pcap options: %s\n", pcap_geterr(handle));
-        pcap_close(handle);
-        handle = NULL;
+        LOG_PRINTF(LOG_ERROR, "Error setting pcap options: %s\n", pcap_geterr(handle));
         goto err;
     }
 
-    if (pcap_activate(handle) != 0)
-    {
-        fprintf(stderr, "Error activating pcap handle: %s\n", pcap_geterr(handle));
-        pcap_close(handle);
-        handle = NULL;
+    if (pcap_activate(handle) != 0) {
+        LOG_PRINTF(LOG_ERROR, "Error activating pcap handle: %s\n", pcap_geterr(handle));
         goto err;
     }
 
     snprintf(filter_exp_part, sizeof(filter_exp_part),
-             "(arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or (ip and dst host %s and ((icmp and icmp[0] = 8) or (udp and (udp dst port 69 or (udp dst portrange %d-%d)))))",
-             (unsigned int)htonl(infos[i - 1].ip),
-             inet_ntoa(*(struct in_addr *)&infos[i - 1].ip), START_PORT, START_PORT + MAX_SESSIONS);
-    snprintf(filter_exp, sizeof(filter_exp),"(%s) or (vlan and (%s))", filter_exp_part, filter_exp_part);
+             "(arp and arp[6:2] = 1 and arp[24:4] = 0x%08X) or (ip and dst host %s and ((icmp and icmp[0] = 8) or (udp and (udp dst port %u or (udp dst portrange %d-%d)))))",
+             (unsigned int)htonl(config->ip_address),
+             inet_ntoa(*(struct in_addr *)&config->ip_address), config->ip_port, config->listen_port_start, config->listen_port_end);
+    snprintf(filter_exp, sizeof(filter_exp), "(%s) or (vlan and (%s))", filter_exp_part, filter_exp_part);
 
+    LOG_PRINTF(LOG_VERBOSE, "Filter: %s\n  ", filter_exp);
 
-    debug("\nFilter: %s\n  ", filter_exp);
-
-    if (pcap_compile(handle, &filter, filter_exp, 0, net) == -1 ||
-        pcap_setfilter(handle, &filter) == -1)
-    {
-        fprintf(stderr, "Error setting filter: %s\n", pcap_geterr(handle));
+    if (pcap_compile(handle, &filter, filter_exp, 0, (bpf_u_int32)dev->mask) == -1 ||
+        pcap_setfilter(handle, &filter) == -1) {
+        LOG_PRINTF(LOG_ERROR, "Error setting filter: %s\n", pcap_geterr(handle));
         goto err;
     }
-
-
-    debug("done\n");
 
     return handle;
 
 err:
-    pcap_freealldevs(alldevs);
+    if (handle != NULL) pcap_close(handle);
+    handle = NULL;
     return NULL;
 }
 

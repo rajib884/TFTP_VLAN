@@ -1,4 +1,5 @@
 #include "packet.h"
+#include "cli_config.h"
 
 #include <stdio.h>
 #include <sys/time.h>
@@ -11,6 +12,7 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 
 extern void handle_tftp(pcap_t *handle, const struct tftp_packet *pkt, uint32_t pkt_len);
 extern uint16_t ipv4_id;
+extern cli_config_t config;
 
 timer_t processing_timer; // only used to measure performance
 
@@ -76,7 +78,7 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
         eth->ethertype = eth_b->ethertype;
     }
 
-    if (!COMPARE_MAC(eth->dest_mac, MY_MAC) && !IS_BROADCAST_MAC(eth->dest_mac))
+    if (!COMPARE_MAC(eth->dest_mac, config.MY_MAC) && !IS_BROADCAST_MAC(eth->dest_mac))
         goto cleanup;
 
     if (ntohs(eth->vlan_tpid) != ETHERTYPE_VLAN)
@@ -91,13 +93,11 @@ void packet_handler(uint8_t *user, const struct pcap_pkthdr *pkthdr, const uint8
         break;
 
     case ETHERTYPE_ARP:
-#ifndef SPOOF_NON_VLAN
-        if (eth->vlan_tci == INVALID_VLAN_TCI) // Skip non VLAN ARP
+        if (eth->vlan_tci == INVALID_VLAN_TCI && !config.is_spoofing) // Skip non VLAN ARP
         {
-            debug("%s: < ARP\n", time_str());
+            debug("%s: < ARP: %s\n", time_str(), get_pkt_str(eth, PKT_ARP, TRUE));
             break;
         }
-#endif
         handle_arp(handle, (const struct arp_packet *)eth, pkt_len);
         break;
 
@@ -123,21 +123,21 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 
     const struct ipv4_packet *ipv4_pkt = (const struct ipv4_packet *)pkt;
 
-    if (ntohl(ipv4_pkt->ip.dest_addr) != MY_IP)
+    if (ipv4_pkt->ip.dest_addr != config.ip_address)
     {
-        debug("%s: < IP: not mine\n", time_str());
+        debug("%s: < IP: %s not mine\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
         return;
     }
 
     if (ipv4_pkt->ip.version_ihl != 0x45) // IPv4 with no options
     {
-        debug("%s: < IP: not supported\n", time_str());
+        debug("%s: < IP: %s not supported\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
         return;
     }
 
     if (ntohs(ipv4_pkt->ip.total_length) + sizeof(struct eth_header) > pkt_len)
     {
-        debug("%s: < IP: length mismatch\n", time_str());
+        debug("%s: < IP: %s length mismatch\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
         return;
     } else {
         pkt_len = ntohs(ipv4_pkt->ip.total_length) + sizeof(struct eth_header);
@@ -145,13 +145,13 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 
     if (ipv4_pkt->ip.flags_offset & htons(0x3FFF))
     {
-        debug("%s: < IP: fragmented\n", time_str());
+        debug("%s: < IP: %s fragmented\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
         return;
     }
 
     if (ipv4_pkt->ip.ttl == 0)
     {
-        debug("%s: < IP: ttl expired\n", time_str());
+        debug("%s: < IP: %s ttl expired\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
         return;
     }
 
@@ -160,7 +160,7 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     if (ipv4_pkt->ip.checksum != 0 && ipv4_checksum(&ipv4_pkt->ip, sizeof(ipv4_pkt->ip)) != 0)
     {
 #ifdef DEBUG
-        debug("%s: < IP: checksum failed\n", time_str());
+        debug("%s: < IP: %s checksum failed\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
         print_ipv4(&ipv4_pkt->ip);
 #endif
         return;
@@ -173,20 +173,20 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
 
         if (pkt_len < sizeof(struct udp_packet) + 4)
         {
-            debug("%s: < UDP: too short\n", time_str());
+            debug("%s: < UDP: %s too short\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
             return;
         }
 
         if (ntohs(packet->udp.len) + sizeof(struct ipv4_packet) > pkt_len)
         {
-            debug("%s: < UDP: length mismatch\n", time_str());
+            debug("%s: < UDP: %s length mismatch\n", time_str(), get_pkt_str(packet, PKT_UDP, TRUE));
             return;
         }
 
 #ifdef VALIDATE_CHECKSUM
         if (packet->udp.checksum != 0 && udp_checksum(&ipv4_pkt->ip, &packet->udp) != 0)
         {
-            debug("%s: < UDP: checksum mismatch\n", time_str());
+            debug("%s: < UDP: %s checksum mismatch\n", time_str(), get_pkt_str(packet, PKT_UDP, TRUE));
             return;
         }
 #endif
@@ -201,29 +201,28 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
     else if (ipv4_pkt->ip.protocol == IPV4_PROTOCOL_ICMP)
     {
         const struct icmp_packet *icmp_pkt = (const struct icmp_packet *)pkt;
-#ifndef SPOOF_NON_VLAN
-        if (icmp_pkt->eth.vlan_tci == INVALID_VLAN_TCI)
-        {
-            debug("%s: < ICMP: non vlan\n", time_str());
-            return;
-        }
-#endif
 
         if (pkt_len < sizeof(struct icmp_packet))
         {
-            debug("%s: < ICMP: too short\n", time_str());
+            debug("%s: < ICMP: %s too short\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
+            return;
+        }
+
+        if (icmp_pkt->eth.vlan_tci == INVALID_VLAN_TCI && !config.is_spoofing)
+        {
+            debug("%s: < ICMP: %s non vlan\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
             return;
         }
 
         if (icmp_pkt->icmp.type != ICMP_ECHO_REQUEST)
         {
-            debug("%s: < ICMP: not req\n", time_str());
+            debug("%s: < ICMP: %s not req\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
             return;
         }
 
         if (icmp_pkt->icmp.code != 0)
         {
-            debug("%s: < ICMP: code mismatch\n", time_str());
+            debug("%s: < ICMP: %s code mismatch\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
             return;
         }
 
@@ -231,20 +230,20 @@ static inline void handle_ipv4(pcap_t *handle, const uint8_t *pkt, uint32_t pkt_
         if (icmp_pkt->icmp.checksum != 0 && ipv4_checksum(&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet)) != 0)
         {
 #ifdef DEBUG
-            debug("%s: < ICMP: checksum mismatch\n", time_str());
+            debug("%s: < ICMP: %s checksum mismatch\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
             print_raw_data((const uint8_t *)&icmp_pkt->icmp, pkt_len - sizeof(struct ipv4_packet));
 #endif
             return;
         }
 #endif
 
-        printf("%s: < ICMP: %s\n", time_str(), inet_ntoa(*(const struct in_addr *)&icmp_pkt->ip.src_addr));
+        LOG_PRINTF(LOG_INFO, "%s: < ICMP: %s\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
 
         send_icmp_reply(handle, icmp_pkt, pkt_len);
     }
     else
     {
-        debug("%s: < IP: unknown protocol\n", time_str());
+        debug("%s: < IP: %s unknown protocol\n", time_str(), get_pkt_str(ipv4_pkt, PKT_IPV4, TRUE));
     }
 
     return;
@@ -268,11 +267,11 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
     size_t i = 0;
     while (i < pkt_len && i < 64)
     {
-        printf("%02X ", ((u_char *)pkt)[i++]);
+        LOG_PRINTF(LOG_INFO, "%02X ", ((u_char *)pkt)[i++]);
         if (i % 16 == 0)
-            printf("\n");
+            LOG_PRINTF(LOG_INFO, "\n");
     }
-    printf("\n---\n");
+    LOG_PRINTF(LOG_INFO, "\n---\n");
 #endif
 
     // Check if VLAN header needs to be removed
@@ -301,11 +300,11 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
     i = 0;
     while (i < pkt_len && i < 64)
     {
-        printf("%02X ", ((u_char *)pkt)[i++]);
+        LOG_PRINTF(LOG_INFO, "%02X ", ((u_char *)pkt)[i++]);
         if (i % 16 == 0)
-            printf("\n");
+            LOG_PRINTF(LOG_INFO, "\n");
     }
-    printf("\n");
+    LOG_PRINTF(LOG_INFO, "\n");
 #endif
 
     return rc;
@@ -317,18 +316,24 @@ static inline int send_via_pcap(pcap_t *handle, struct eth_header *eth, int pkt_
  */
 int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet_len)
 {
-    /* Effective MTU for the IP packet depends on whether VLAN is tagged */
-    const int ETH_MTU = (packet->eth.vlan_tci != INVALID_VLAN_TCI) ? 1496 : 1500;
+    int ETH_MTU = 0;
     uint16_t ip_total = ntohs(packet->ip.total_length);
     int rc = 0;
 
     if (ip_total + sizeof(struct eth_header) != packet_len)
     {
-        debug("    Error Sending Packet: IP total length (%llu) does not match packet length (%u).\n", ip_total + sizeof(struct eth_header), packet_len);
+        LOG_PRINTF(LOG_ERROR, "    Error Sending Packet: IP total length (%llu) does not match packet length (%u).\n", ip_total + sizeof(struct eth_header), packet_len);
 #ifdef DEBUG
         print_ipv4(&packet->ip);
 #endif
         return -1;
+    }
+
+    /* Effective MTU for the IP packet depends on whether VLAN is tagged */
+    if (((uint32_t *)packet)[0] == (uint32_t)-1 || packet->eth.vlan_tci == INVALID_VLAN_TCI) {
+        ETH_MTU = config.mtu; /* Not VLAN Tagged Packet */ 
+    } else {
+        ETH_MTU = config.mtu - 4; /* VLAN Tagged Packet */
     }
 
     /* If IPv4 packet fits into MTU, send as single frame. */
@@ -344,6 +349,8 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         }
 
         return 0;
+    } else {
+        LOG_PRINTF(LOG_VERBOSE, "    Fragmentation Needed, MTU: %u, packet size: %u\n", ETH_MTU, ip_total);
     }
 
     /* Fragmentation required */
@@ -401,7 +408,7 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         /* Send fragment */
         if ((rc = send_via_pcap(handle, (struct eth_header *)packet_fragment, sizeof(struct ipv4_packet) + frag_payload)) != 0)
         {
-            debug("    Error sending fragment (offset %u, size %llu) pcap_sendpacket[%d]\n", offset_bytes, sizeof(struct ipv4_packet) + frag_payload, rc);
+            LOG_PRINTF(LOG_VERBOSE, "    Error sending fragment (offset %u, size %llu) pcap_sendpacket[%d]\n", offset_bytes, sizeof(struct ipv4_packet) + frag_payload, rc);
 #ifdef DEBUG
             print_ipv4(&packet_fragment->ip);
 #endif
@@ -411,7 +418,7 @@ int send_ipv4_packet(pcap_t *handle, struct ipv4_packet *packet, uint32_t packet
         }
         else
         {
-            debug("    Fragment Sent (offset %u, %u bytes, MF=%d)\n", offset_bytes, frag_payload, more_fragments);
+            LOG_PRINTF(LOG_VERBOSE, "    Fragment Sent (offset %u, %u bytes, MF=%d)\n", offset_bytes, frag_payload, more_fragments);
         }
 
         offset_bytes += frag_payload;
@@ -432,38 +439,38 @@ static inline void handle_arp(pcap_t *handle, const struct arp_packet *arp_packe
 
     if (ntohs(arp_packet->arp.opcode) != ARP_REQUEST)
     {
-        debug("%s: < ARP: not req\n", time_str());
+        debug("%s: < ARP: %s not req\n", time_str(), get_pkt_str(arp_packet, PKT_ARP, TRUE));
         return;
     }
 
-    if (ntohl(arp_packet->arp.target_ip) != MY_IP)
+    if (arp_packet->arp.target_ip != config.ip_address)
     {
-        debug("%s: < ARP: for %s\n", time_str(), inet_ntoa(*(struct in_addr *)&arp_packet->arp.target_ip));
+        debug("%s: < ARP: %s for %s\n", time_str(), get_pkt_str(arp_packet, PKT_ARP, TRUE), inet_ntoa(*(struct in_addr *)&arp_packet->arp.target_ip));
         return;
     }
 
     if (ntohs(arp_packet->arp.hw_type) != ARP_HW_TYPE_ETHERNET)
     {
-        debug("%s: < ARP: not eth\n", time_str());
+        debug("%s: < ARP: %s not eth\n", time_str(), get_pkt_str(arp_packet, PKT_ARP, TRUE));
         return;
     }
 
     if (ntohs(arp_packet->arp.protocol_type) != ETHERTYPE_IPV4)
     {
-        debug("%s: < ARP: not IPv4\n", time_str());
+        debug("%s: < ARP: %s not IPv4\n", time_str(), get_pkt_str(arp_packet, PKT_ARP, TRUE));
         return;
     }
 
     if (arp_packet->arp.hw_size != 6 || arp_packet->arp.protocol_size != 4)
     {
-        debug("%s: < ARP: invalid hw/proto\n", time_str());
+        debug("%s: < ARP: %s invalid hw/proto\n", time_str(), get_pkt_str(arp_packet, PKT_ARP, TRUE));
         return;
     }
 
     // debug("  Src: %s\n", inet_ntoa(*(const struct in_addr *)&arp_packet->arp.sender_ip));
     // debug("  Dst: %s\n", inet_ntoa(*(const struct in_addr *)&arp_packet->arp.target_ip));
     
-    printf("%s: < ARP: %s\n", time_str(), inet_ntoa(*(const struct in_addr *)&arp_packet->arp.sender_ip));
+    LOG_PRINTF(LOG_INFO, "%s: < ARP: %s\n", time_str(), get_pkt_str(arp_packet, PKT_ARP, TRUE));
 
     send_arp_reply(handle, arp_packet);
 }
@@ -474,7 +481,7 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
 
     // Ethernet Headers
     memcpy(arp_reply.eth.dest_mac, arp_req->eth.src_mac, sizeof(arp_reply.eth.dest_mac));
-    memcpy(arp_reply.eth.src_mac, MY_MAC, sizeof(arp_reply.eth.src_mac));
+    memcpy(arp_reply.eth.src_mac, config.MY_MAC, sizeof(arp_reply.eth.src_mac));
     arp_reply.eth.vlan_tpid = htons(ETHERTYPE_VLAN);
     arp_reply.eth.vlan_tci = arp_req->eth.vlan_tci;
     arp_reply.eth.ethertype = htons(ETHERTYPE_ARP);
@@ -485,16 +492,16 @@ static inline void send_arp_reply(pcap_t *handle, const struct arp_packet *arp_r
     arp_reply.arp.hw_size = sizeof(arp_reply.arp.sender_mac);      // MAC size
     arp_reply.arp.protocol_size = sizeof(arp_reply.arp.sender_ip); // IPv4 size
     arp_reply.arp.opcode = htons(ARP_REPLY);
-    memcpy(arp_reply.arp.sender_mac, MY_MAC, sizeof(arp_reply.arp.sender_mac));
+    memcpy(arp_reply.arp.sender_mac, config.MY_MAC, sizeof(arp_reply.arp.sender_mac));
     arp_reply.arp.sender_ip = arp_req->arp.target_ip;
     memcpy(arp_reply.arp.target_mac, arp_req->arp.sender_mac, sizeof(arp_reply.arp.target_mac));
     arp_reply.arp.target_ip = arp_req->arp.sender_ip;
 
 #if 0
-    printf("  Sending ARP Reply to ");
+    LOG_PRINTF(LOG_INFO, "  Sending ARP Reply to ");
     print_mac(arp_req->eth.src_mac);
 #else
-    printf("%s: > ARP: %s\n\n", time_str(), inet_ntoa(*(const struct in_addr *)&arp_reply.arp.target_ip));
+    LOG_PRINTF(LOG_INFO, "%s: > ARP: %s\n\n", time_str(), get_pkt_str(&arp_reply, PKT_ARP, FALSE));
 #endif
 
     if (send_via_pcap(handle, (struct eth_header *)&arp_reply, sizeof(arp_reply)) != 0)
@@ -512,7 +519,7 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 
     if (icmp_data_len > ICMP_MAX_DATA)
     {
-        debug("%s: > ICMP: data too big\n", time_str());
+        debug("%s: > ICMP: %s data too big\n\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
         return;
     }
 
@@ -520,7 +527,7 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
     icmp_reply = (struct icmp_packet *)malloc(pkt_len);
     if (icmp_reply == NULL)
     {
-        debug("%s: > ICMP: malloc fail\n", time_str());
+        debug("%s: > ICMP: %s malloc fail\n\n", time_str(), get_pkt_str(icmp_pkt, PKT_ICMP, TRUE));
         fprintf(stderr, "  Memory allocation failed for ICMP reply.\n");
         return;
     }
@@ -552,15 +559,15 @@ static inline void send_icmp_reply(pcap_t *handle, const struct icmp_packet *icm
 
     // Ethernet Headers
     memcpy(icmp_reply->eth.dest_mac, icmp_pkt->eth.src_mac, sizeof(icmp_reply->eth.dest_mac));
-    memcpy(icmp_reply->eth.src_mac, MY_MAC, sizeof(icmp_reply->eth.src_mac));
+    memcpy(icmp_reply->eth.src_mac, config.MY_MAC, sizeof(icmp_reply->eth.src_mac));
     icmp_reply->eth.vlan_tpid = htons(ETHERTYPE_VLAN);
     icmp_reply->eth.vlan_tci = icmp_pkt->eth.vlan_tci;
     icmp_reply->eth.ethertype = htons(ETHERTYPE_IPV4);
 
-    printf("%s: > ICMP: %s\n\n", time_str(), inet_ntoa(*(const struct in_addr *)&icmp_reply->ip.dest_addr));
+    LOG_PRINTF(LOG_INFO, "%s: > ICMP: %s\n\n", time_str(), get_pkt_str(icmp_reply, PKT_ICMP, FALSE));
     if (send_ipv4_packet(handle, (struct ipv4_packet *)icmp_reply, sizeof(struct icmp_packet) + icmp_data_len) != 0)
     {
-        printf("    Error sending ICMP packet\n");
+        LOG_PRINTF(LOG_ERROR, "    Error sending ICMP packet\n");
     }
 
     free(icmp_reply);
@@ -632,58 +639,113 @@ unsigned short udp_checksum(const struct ipv4_header *ip, const struct udp_heade
     return htons(~sum);
 }
 
-char *get_tftp_pkt_desc(const struct tftp_packet *tftp, int use_src)
+char *get_pkt_str(const void *pkt, packet_type type, int use_src)
 {
-    static char buf[256];
-    char opcode_buf[64];
-    char ipbuf[INET_ADDRSTRLEN];
+    static char buf[256] = {0};
+    char opcode_buf[64] = {0};
+    char ipbuf[INET_ADDRSTRLEN] = {0};
     const uint32_t *ip_addr = NULL;
     uint16_t port = 0;
     uint16_t vlan = 0;
 
-    if (ntohs(tftp->eth.vlan_tpid) == ETHERTYPE_VLAN && tftp->eth.vlan_tci != INVALID_VLAN_TCI) {
-        vlan = ntohs(tftp->eth.vlan_tci) & 0x0FFF;
+    if (!pkt) {
+        snprintf(buf, sizeof(buf), "NULL");
+        return buf;
     }
 
-    ip_addr = use_src ? &tftp->ip.src_addr : &tftp->ip.dest_addr;
-    port = use_src ? ntohs(tftp->udp.source) : ntohs(tftp->udp.dest);
-    inet_ntop(AF_INET, ip_addr, ipbuf, sizeof(ipbuf));
-
-    switch (ntohs(tftp->tftp.opcode))
+    switch (type)
     {
-    case OPCODE_RRQ:
-        snprintf(opcode_buf, sizeof(opcode_buf), "RRQ");
-        break;
 
-    case OPCODE_WRQ:
-        snprintf(opcode_buf, sizeof(opcode_buf), "WRQ");
-        break;
+    case PKT_ARP:
+    {
+        const struct arp_packet *arp = pkt;
 
-    case OPCODE_DATA:
-        snprintf(opcode_buf, sizeof(opcode_buf), "DATA[%u]", ntohs(tftp->tftp.data.block_number));
-        break;
+        if (ntohs(arp->eth.vlan_tpid) == ETHERTYPE_VLAN && arp->eth.vlan_tci != INVALID_VLAN_TCI)
+            vlan = ntohs(arp->eth.vlan_tci) & 0x0FFF;
 
-    case OPCODE_ACK:
-        snprintf(opcode_buf, sizeof(opcode_buf), "ACK[%u]", ntohs(tftp->tftp.ack.block_number));
+        ip_addr = use_src ? &arp->arp.sender_ip : &arp->arp.target_ip;
         break;
+    }
 
-    case OPCODE_ERROR:
-        snprintf(opcode_buf, sizeof(opcode_buf), "ERR[%u]", ntohs(tftp->tftp.error.error_code));
-        break;
+    case PKT_IPV4:
+    case PKT_ICMP:
+    case PKT_UDP:
+    case PKT_TFTP:
+    {
+        const struct ipv4_packet *ipv4 = pkt;
 
-    case OPCODE_OACK:
-        snprintf(opcode_buf, sizeof(opcode_buf), "OACK");
+        if (ntohs(ipv4->eth.vlan_tpid) == ETHERTYPE_VLAN && ipv4->eth.vlan_tci != INVALID_VLAN_TCI)
+            vlan = ntohs(ipv4->eth.vlan_tci) & 0x0FFF;
+
+        ip_addr = use_src ? &ipv4->ip.src_addr : &ipv4->ip.dest_addr;
+
+        if (type == PKT_UDP || type == PKT_TFTP)
+        {
+            const struct udp_packet *udp = pkt;
+            port = use_src ? ntohs(udp->udp.source) : ntohs(udp->udp.dest);
+        }
+
         break;
+    }
 
     default:
-        snprintf(opcode_buf, sizeof(opcode_buf), "UNK");
-        break;
+        snprintf(buf, sizeof(buf), "Unknown");
+        return buf;
     }
 
-    if (vlan)
-        snprintf(buf, sizeof(buf), "[v%u]%s:%u %s", vlan, ipbuf, port, opcode_buf);
-    else
-        snprintf(buf, sizeof(buf), "%s:%u %s", ipbuf, port, opcode_buf);
+    if (!ip_addr)
+    {
+        snprintf(buf, sizeof(buf), "Invalid");
+        return buf;
+    }
+
+    inet_ntop(AF_INET, ip_addr, ipbuf, sizeof(ipbuf));
+
+    if (type == PKT_TFTP) {
+        const struct tftp_packet *tftp = pkt;
+        switch (ntohs(tftp->tftp.opcode))
+        {
+        case OPCODE_RRQ:
+            snprintf(opcode_buf, sizeof(opcode_buf), " RRQ");
+            break;
+
+        case OPCODE_WRQ:
+            snprintf(opcode_buf, sizeof(opcode_buf), " WRQ");
+            break;
+
+        case OPCODE_DATA:
+            snprintf(opcode_buf, sizeof(opcode_buf), " DATA[%u]", ntohs(tftp->tftp.data.block_number));
+            break;
+
+        case OPCODE_ACK:
+            snprintf(opcode_buf, sizeof(opcode_buf), " ACK[%u]", ntohs(tftp->tftp.ack.block_number));
+            break;
+
+        case OPCODE_ERROR:
+            snprintf(opcode_buf, sizeof(opcode_buf), " ERR[%u]", ntohs(tftp->tftp.error.error_code));
+            break;
+
+        case OPCODE_OACK:
+            snprintf(opcode_buf, sizeof(opcode_buf), " OACK");
+            break;
+
+        default:
+            snprintf(opcode_buf, sizeof(opcode_buf), " UNK");
+            break;
+        }
+    }
+
+    if (port) {
+        if (vlan)
+            snprintf(buf, sizeof(buf), "[v%u]%s:%u%s", vlan, ipbuf, port, opcode_buf);
+        else
+            snprintf(buf, sizeof(buf), "%s:%u%s", ipbuf, port, opcode_buf);
+    } else {
+        if (vlan)
+            snprintf(buf, sizeof(buf), "[v%u]%s", vlan, ipbuf);
+        else
+            snprintf(buf, sizeof(buf), "%s", ipbuf);
+    }
 
     return buf;
 }
@@ -698,42 +760,42 @@ char *time_str()
     snprintf(buf, sizeof(buf), "%04d/%02d/%02d %02d:%02d:%02d.%03d", st.wYear, st.wMonth, st.wDay,
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
 #else
-    snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%03u",
-             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    snprintf(buf, sizeof(buf), "%s%s%02u:%02u:%02u.%03u%s", CLR_DIM, CLR_ITALIC,
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, CLR_RESET);
 #endif
     return buf;
 }
 
 void print_mac(const uint8_t *mac)
 {
-    printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+    LOG_PRINTF(LOG_INFO, "%02X:%02X:%02X:%02X:%02X:%02X\n",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 void print_ipv4(const struct ipv4_header *hdr)
 {
-    printf("    IP.version_ihl: 0x%02X\n", hdr->version_ihl);
-    printf("    IP.tos: 0x%02X\n", hdr->tos);
-    printf("    IP.total_length: %u\n", ntohs(hdr->total_length));
-    printf("    IP.id: %u\n", ntohs(hdr->id));
-    printf("    IP.flags_offset: 0x%04X\n", ntohs(hdr->flags_offset));
-    printf("    IP.ttl: %u\n", hdr->ttl);
-    printf("    IP.protocol: %u\n", hdr->protocol);
-    printf("    IP.checksum: 0x%04X\n", ntohs(hdr->checksum));
+    LOG_PRINTF(LOG_INFO, "    IP.version_ihl: 0x%02X\n", hdr->version_ihl);
+    LOG_PRINTF(LOG_INFO, "    IP.tos: 0x%02X\n", hdr->tos);
+    LOG_PRINTF(LOG_INFO, "    IP.total_length: %u\n", ntohs(hdr->total_length));
+    LOG_PRINTF(LOG_INFO, "    IP.id: %u\n", ntohs(hdr->id));
+    LOG_PRINTF(LOG_INFO, "    IP.flags_offset: 0x%04X\n", ntohs(hdr->flags_offset));
+    LOG_PRINTF(LOG_INFO, "    IP.ttl: %u\n", hdr->ttl);
+    LOG_PRINTF(LOG_INFO, "    IP.protocol: %u\n", hdr->protocol);
+    LOG_PRINTF(LOG_INFO, "    IP.checksum: 0x%04X\n", ntohs(hdr->checksum));
     struct in_addr src_addr;
     src_addr.s_addr = hdr->src_addr;
-    printf("    IP.src_addr: %s\n", inet_ntoa(src_addr));
+    LOG_PRINTF(LOG_INFO, "    IP.src_addr: %s\n", inet_ntoa(src_addr));
     struct in_addr dest_addr;
     dest_addr.s_addr = hdr->dest_addr;
-    printf("    IP.dest_addr: %s\n", inet_ntoa(dest_addr));
+    LOG_PRINTF(LOG_INFO, "    IP.dest_addr: %s\n", inet_ntoa(dest_addr));
 }
 
 void print_udp(const struct udp_header *hdr)
 {
-    printf("    UDP.source: %u\n", ntohs(hdr->source));
-    printf("    UDP.dest: %u\n", ntohs(hdr->dest));
-    printf("    UDP.len: %u\n", ntohs(hdr->len));
-    printf("    UDP.checksum: 0x%04X\n", ntohs(hdr->checksum));
+    LOG_PRINTF(LOG_INFO, "    UDP.source: %u\n", ntohs(hdr->source));
+    LOG_PRINTF(LOG_INFO, "    UDP.dest: %u\n", ntohs(hdr->dest));
+    LOG_PRINTF(LOG_INFO, "    UDP.len: %u\n", ntohs(hdr->len));
+    LOG_PRINTF(LOG_INFO, "    UDP.checksum: 0x%04X\n", ntohs(hdr->checksum));
 }
 
 void print_raw_data(const uint8_t *data, size_t len)
@@ -747,30 +809,30 @@ void print_raw_data(const uint8_t *data, size_t len)
         print_raw_data(data, BREAK_AFTER);
         i = BREAK_AFTER * (len / BREAK_AFTER);
         if (i == len) i -= BREAK_AFTER;
-        printf("    ");
-        for (j = 0; j < PER_ROW; j++) printf("----");
-        printf("---\n");
+        LOG_PRINTF(LOG_INFO, "    ");
+        for (j = 0; j < PER_ROW; j++) LOG_PRINTF(LOG_INFO, "----");
+        LOG_PRINTF(LOG_INFO, "---\n");
     } else i = 0;
 
     for (; i < len; i += PER_ROW)
     {
         /* Hex part */
-        printf("    ");
+        LOG_PRINTF(LOG_INFO, "    ");
         for (j = 0; j < PER_ROW; j++)
         {
             if (i + j < len)
-                printf("%02X ", data[i + j]);
+                LOG_PRINTF(LOG_INFO, "%02X ", data[i + j]);
             else
-                printf("   "); /* padding for last line */
+                LOG_PRINTF(LOG_INFO, "   "); /* padding for last line */
         }
 
         /* ASCII part */
-        printf(" |");
+        LOG_PRINTF(LOG_INFO, " |");
         for (j = 0; j < PER_ROW && i + j < len; j++)
         {
             uint8_t c = data[i + j];
-            printf("%c", (c >= 0x20 && c <= 0x7E) ? c : '.');
+            LOG_PRINTF(LOG_INFO, "%c", (c >= 0x20 && c <= 0x7E) ? c : '.');
         }
-        printf("|\n");
+        LOG_PRINTF(LOG_INFO, "|\n");
     }
 }
