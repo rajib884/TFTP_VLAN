@@ -51,7 +51,7 @@ debug: $(OBJS)
 	$(CC) -c $< -o $@ $(CFLAGS)
 
 clean:
-	del /Q *.o main.exe main_debug.exe 2>nul || rm -f *.o main main_debug
+	rm -f *.o main main.exe main_debug main_debug.exe
 
 # gcc -g -O0 -o debug main.c packet.c pcap_fun.c tftp.c queue.c -Wall -I "C:\Program Files\Npcap\Include" -I "include" -D_WIN32_WINNT=0x0600 -L "C:\Program Files\Npcap\Lib\x64" -lwpcap -lpacket -lws2_32 -liphlpapi -DVALIDATE_CHECKSUM -DDEBUG
 

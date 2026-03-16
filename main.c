@@ -22,7 +22,7 @@ int main(int argc, char *argv[])
     pcap_t *handle = NULL;
     
     /* Event handles array: [0] = pcap, [1..MAX_FTP_DOWNLOADS] = FTP sockets */
-    HANDLE waitHandles[1 + MAX_FTP_DOWNLOADS + 1 + DB_MAX_CLIENTS] = {0};
+    HANDLE waitHandles[1 + MAX_FTP_DOWNLOADS] = {0};
     int totalHandles = 0;
     long timeout_ms = 0;
     DWORD rc = 0;
@@ -141,10 +141,9 @@ int main(int argc, char *argv[])
         log_flush();
 
         int ftp_n = ftp_get_event_handles(&waitHandles[1], MAX_FTP_DOWNLOADS);
-        int db_n  = dashboard_get_event_handles(&waitHandles[1 + ftp_n]);
 
         /* Get current event handles and recommended timeout from FTP */
-        totalHandles = 1 + ftp_n + db_n;
+        totalHandles = 1 + ftp_n;
         timeout_ms = ftp_get_timeout_ms(1000);
         rc = WaitForMultipleObjects(totalHandles, waitHandles, FALSE, timeout_ms);
 
